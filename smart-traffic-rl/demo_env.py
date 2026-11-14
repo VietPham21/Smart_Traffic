@@ -61,6 +61,7 @@ from core.config import (
     DELTA_V_MAX,
 )
 from core.env import TrafficLightEnv
+from ui.traffic_renderer import TrafficRenderer
 
 
 # Premium High-Contrast Color Palette
@@ -131,11 +132,24 @@ class EnvironmentInspectorApp:
                 "mono_small": pygame.font.SysFont("Consolas", 11),
             }
 
+            self.renderer = TrafficRenderer(
+                offset_x=0,
+                offset_y=0,
+                panel_w=650,
+                panel_h=self.window_height,
+                road_w=140,
+            )
+            self.renderer.reset(self.env)
+        else:
+            self.renderer = None
+
     def reset_env(self, scenario_id: str | None = None) -> None:
         if scenario_id:
             self.scenario_id = scenario_id
         self.env = TrafficLightEnv(scenario_id=self.scenario_id, seed=self.seed)
         self.obs, self.info = self.env.reset(seed=self.seed)
+        if self.renderer:
+            self.renderer.reset(self.env)
         self.last_action = ACTION_KEEP
         self.last_reward = 0.0
         self.is_last_action_rejected = False
@@ -162,6 +176,8 @@ class EnvironmentInspectorApp:
             self.status_message = f"✅ Thực hiện {action_name} thành công."
 
         self.obs, self.last_reward, term, trunc, self.info = self.env.step(requested_action)
+        if self.renderer:
+            self.renderer.sync_with_env(self.env)
         if term or trunc:
             self.status_message = "🏁 Tập mô phỏng đã hoàn thành! Bấm [R] để reset."
 
@@ -206,60 +222,11 @@ class EnvironmentInspectorApp:
 
         pygame.display.flip()
 
-    def _draw_smooth_circle(self, x: int, y: int, radius: int, color: tuple[int, int, int], glow: bool = False, glow_color: tuple[int, int, int] | None = None) -> None:
-        """Draw an anti-aliased circle with optional halo glow."""
-        if glow and glow_color:
-            pygame.gfxdraw.filled_circle(self.screen, x, y, radius + 5, glow_color)
-            pygame.gfxdraw.aacircle(self.screen, x, y, radius + 5, glow_color)
-        pygame.gfxdraw.filled_circle(self.screen, x, y, radius, color)
-        pygame.gfxdraw.aacircle(self.screen, x, y, radius, (255, 255, 255) if glow else (60, 60, 60))
-
     def _render_intersection_panel(self, x: int, y: int, w: int, h: int) -> None:
-        cx, cy = x + w // 2, y + h // 2
-        road_w = 140
+        if self.renderer:
+            self.renderer.render(self.screen, self.env, self.fonts)
 
-        # Nền đường nhựa
-        pygame.draw.rect(self.screen, COLOR_ROAD, (cx - road_w // 2, 0, road_w, h))
-        pygame.draw.rect(self.screen, COLOR_ROAD, (x, cy - road_w // 2, w, road_w))
-
-        # Vạch kẻ tim đường nét đứt (Dashed center lane markings)
-        dash_len = 16
-        gap_len = 12
-        # Đường dọc Bắc - Nam
-        for dy in range(10, cy - road_w // 2, dash_len + gap_len):
-            pygame.draw.line(self.screen, COLOR_LANE_DASH, (cx, dy), (cx, dy + dash_len), 2)
-        for dy in range(cy + road_w // 2 + 10, h - 80, dash_len + gap_len):
-            pygame.draw.line(self.screen, COLOR_LANE_DASH, (cx, dy), (cx, dy + dash_len), 2)
-        # Đường ngang Đông - Tây
-        for dx in range(10, cx - road_w // 2, dash_len + gap_len):
-            pygame.draw.line(self.screen, COLOR_LANE_DASH, (dx, cy), (dx + dash_len, cy), 2)
-        for dx in range(cx + road_w // 2 + 10, w - 10, dash_len + gap_len):
-            pygame.draw.line(self.screen, COLOR_LANE_DASH, (dx, cy), (dx + dash_len, cy), 2)
-
-        # Vạch dừng xe (Solid Stop Lines)
-        stop = road_w // 2
-        pygame.draw.line(self.screen, COLOR_ROAD_MARKING, (cx - stop, cy - stop), (cx + stop, cy - stop), 3)
-        pygame.draw.line(self.screen, COLOR_ROAD_MARKING, (cx - stop, cy + stop), (cx + stop, cy + stop), 3)
-        pygame.draw.line(self.screen, COLOR_ROAD_MARKING, (cx - stop, cy - stop), (cx - stop, cy + stop), 3)
-        pygame.draw.line(self.screen, COLOR_ROAD_MARKING, (cx + stop, cy - stop), (cx + stop, cy + stop), 3)
-
-        # Đèn tín hiệu giao thông (Sắc nét khử răng cưa với hiệu ứng Glow)
         is_ns_green = (self.env.phase == PHASE_NS)
-        c_ns = COLOR_GREEN if is_ns_green else COLOR_RED
-        glow_ns = COLOR_GREEN_GLOW if is_ns_green else COLOR_RED_GLOW
-
-        c_ew = COLOR_RED if is_ns_green else COLOR_GREEN
-        glow_ew = COLOR_RED_GLOW if is_ns_green else COLOR_GREEN_GLOW
-
-        # Đèn Bắc & Nam
-        self._draw_smooth_circle(cx, cy - stop - 22, 13, c_ns, glow=True, glow_color=glow_ns)
-        self._draw_smooth_circle(cx, cy + stop + 22, 13, c_ns, glow=True, glow_color=glow_ns)
-        # Đèn Đông & Tây
-        self._draw_smooth_circle(cx + stop + 22, cy, 13, c_ew, glow=True, glow_color=glow_ew)
-        self._draw_smooth_circle(cx - stop - 22, cy, 13, c_ew, glow=True, glow_color=glow_ew)
-
-        # Vẽ hàng xe đang chờ (Queues)
-        self._render_vehicles(cx, cy, road_w)
 
         # Banner Tiêu Đề Trên Cùng
         t_title = self.fonts["header"].render("MÔ HÌNH HÓA NGÃ TƯ 4 HƯỚNG (TrafficLightEnv)", True, COLOR_TEXT_PRIMARY)
@@ -282,55 +249,6 @@ class EnvironmentInspectorApp:
         pygame.draw.rect(self.screen, box_border, (20, box_y, w - 40, 48), 1, border_radius=6)
         msg_txt = self.fonts["bold"].render(self.status_message, True, box_txt_color)
         self.screen.blit(msg_txt, (35, box_y + 14))
-
-    def _render_vehicles(self, cx: int, cy: int, road_w: int) -> None:
-        """Draw queued vehicles with clean rounded corners and windshield details."""
-        stop = road_w // 2
-        car_w, car_h = 24, 15
-
-        car_body = (56, 189, 248)
-        car_border = (20, 100, 150)
-        windshield = (210, 240, 255)
-
-        # North queue (chạy về hướng Nam)
-        for idx, veh in enumerate(self.env.queues[NORTH][:11]):
-            vy = (cy - stop - 18) - idx * (car_w + 5)
-            rx, ry = cx - 18, vy - car_w
-            pygame.draw.rect(self.screen, car_body, (rx, ry, car_h, car_w), border_radius=4)
-            pygame.draw.rect(self.screen, car_border, (rx, ry, car_h, car_w), 1, border_radius=4)
-            pygame.draw.rect(self.screen, windshield, (rx + 2, ry + car_w - 8, car_h - 4, 4), border_radius=1)
-
-        # South queue (chạy về hướng Bắc)
-        for idx, veh in enumerate(self.env.queues[SOUTH][:11]):
-            vy = (cy + stop + 18) + idx * (car_w + 5)
-            rx, ry = cx + 4, vy
-            pygame.draw.rect(self.screen, car_body, (rx, ry, car_h, car_w), border_radius=4)
-            pygame.draw.rect(self.screen, car_border, (rx, ry, car_h, car_w), 1, border_radius=4)
-            pygame.draw.rect(self.screen, windshield, (rx + 2, ry + 4, car_h - 4, 4), border_radius=1)
-
-        # East queue (chạy về hướng Tây)
-        for idx, veh in enumerate(self.env.queues[EAST][:11]):
-            vx = (cx + stop + 18) + idx * (car_w + 5)
-            rx, ry = vx, cy - 18
-            pygame.draw.rect(self.screen, car_body, (rx, ry, car_w, car_h), border_radius=4)
-            pygame.draw.rect(self.screen, car_border, (rx, ry, car_w, car_h), 1, border_radius=4)
-            pygame.draw.rect(self.screen, windshield, (rx + 4, ry + 2, 4, car_h - 4), border_radius=1)
-
-        # West queue (chạy về hướng Đông)
-        for idx, veh in enumerate(self.env.queues[WEST][:11]):
-            vx = (cx - stop - 18) - idx * (car_w + 5)
-            rx, ry = vx - car_w, cy + 4
-            pygame.draw.rect(self.screen, car_body, (rx, ry, car_w, car_h), border_radius=4)
-            pygame.draw.rect(self.screen, car_border, (rx, ry, car_w, car_h), 1, border_radius=4)
-            pygame.draw.rect(self.screen, windshield, (rx + car_w - 8, ry + 2, 4, car_h - 4), border_radius=1)
-
-        # Nhãn thông tin từng nhánh
-        q = self.info["raw_queues"]
-        w = self.info["max_waits"]
-        self.screen.blit(self.fonts["bold"].render(f"Bắc (N): {q[0]} xe | Đợi: {w[0]:.1f}s", True, COLOR_TEXT_PRIMARY), (cx - 95, cy - stop - 48))
-        self.screen.blit(self.fonts["bold"].render(f"Nam (S): {q[1]} xe | Đợi: {w[1]:.1f}s", True, COLOR_TEXT_PRIMARY), (cx - 95, cy + stop + 42))
-        self.screen.blit(self.fonts["bold"].render(f"Đông (E): {q[2]} xe | Đợi: {w[2]:.1f}s", True, COLOR_TEXT_PRIMARY), (cx + stop + 40, cy - 25))
-        self.screen.blit(self.fonts["bold"].render(f"Tây (W): {q[3]} xe | Đợi: {w[3]:.1f}s", True, COLOR_TEXT_PRIMARY), (cx - stop - 195, cy + 30))
 
     def _render_telemetry_panel(self, x: int, y: int, w: int, h: int) -> None:
         """Render detailed MDP state vector, action mask, and reward breakdown."""
@@ -460,11 +378,20 @@ class EnvironmentInspectorApp:
             return
 
         step_idx = 0
+        last_ticks = pygame.time.get_ticks()
         while self.is_running:
             if not self.handle_events():
                 break
 
             now = pygame.time.get_ticks()
+            dt = (now - last_ticks) / 1000.0
+            last_ticks = now
+            if dt > 0.08:
+                dt = 0.016
+
+            if self.renderer:
+                self.renderer.update(dt)
+
             if self.auto_step and (now - self.last_step_time >= self.step_delay_ms):
                 mask = self.info["action_mask"]
                 chosen = ACTION_KEEP if mask[ACTION_KEEP] == 1 else ACTION_SWITCH

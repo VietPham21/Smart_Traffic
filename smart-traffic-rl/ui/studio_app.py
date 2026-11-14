@@ -73,6 +73,7 @@ from core.traffic_generator import TrafficGenerator
 from agents.base_agent import BaseAgent
 from agents.baselines import MaxPressureAgent, FixedTimeAgent
 from agents.dqn_agent import DQNAgent
+from ui.traffic_renderer import TrafficRenderer
 
 
 class SplitScreenStudio:
@@ -122,6 +123,8 @@ class SplitScreenStudio:
         self.screen: Any = None
         self.clock: Any = None
         self.fonts: dict[str, Any] = {}
+        self.renderer_baseline: Any = None
+        self.renderer_rl: Any = None
 
         if not self.headless:
             self._init_pygame()
@@ -142,6 +145,26 @@ class SplitScreenStudio:
             self.fonts["body"] = pygame.font.SysFont("Segoe UI, Roboto, Arial", 14)
             self.fonts["metric"] = pygame.font.SysFont("Segoe UI, Roboto, Arial", 22, bold=True)
             self.fonts["small"] = pygame.font.SysFont("Segoe UI, Roboto, Arial", 12)
+            self.fonts["bold"] = pygame.font.SysFont("Segoe UI, Roboto, Arial", 12, bold=True)
+
+            # Continuous Vehicle Physics Renderers
+            self.renderer_baseline = TrafficRenderer(
+                offset_x=0,
+                offset_y=0,
+                panel_w=LEFT_PANE_WIDTH,
+                panel_h=WINDOW_HEIGHT,
+                road_w=120,
+            )
+            self.renderer_baseline.reset(self.env_baseline)
+
+            self.renderer_rl = TrafficRenderer(
+                offset_x=LEFT_PANE_WIDTH,
+                offset_y=0,
+                panel_w=MID_PANE_WIDTH,
+                panel_h=WINDOW_HEIGHT,
+                road_w=120,
+            )
+            self.renderer_rl.reset(self.env_rl)
         except Exception as e:
             print(f"[SplitScreenStudio] Falling back to headless mode: {e}")
             self.headless = True
@@ -164,6 +187,11 @@ class SplitScreenStudio:
         self.baseline_agent.reset()
         self.rl_agent.reset()
 
+        if hasattr(self, "renderer_baseline") and self.renderer_baseline:
+            self.renderer_baseline.reset(self.env_baseline)
+        if hasattr(self, "renderer_rl") and self.renderer_rl:
+            self.renderer_rl.reset(self.env_rl)
+
     def step(self) -> tuple[dict[str, Any], dict[str, Any]]:
         """Advance both baseline and RL environments synchronously by one decision step.
 
@@ -176,6 +204,8 @@ class SplitScreenStudio:
             eval_mode=True,
         )
         self.obs_baseline, r_base, term_b, trunc_b, self.info_baseline = self.env_baseline.step(action_base)
+        if self.renderer_baseline:
+            self.renderer_baseline.sync_with_env(self.env_baseline)
 
         # 2. RL Agent Decision
         action_rl = self.rl_agent.select_action(
@@ -184,6 +214,8 @@ class SplitScreenStudio:
             eval_mode=True,
         )
         self.obs_rl, r_rl, term_r, trunc_r, self.info_rl = self.env_rl.step(action_rl)
+        if self.renderer_rl:
+            self.renderer_rl.sync_with_env(self.env_rl)
 
         return self.info_baseline, self.info_rl
 
@@ -237,59 +269,14 @@ class SplitScreenStudio:
                         return
 
     def render_intersection(self, surface: Any, offset_x: int, env: TrafficLightEnv, title: str, accent_color: tuple[int, int, int]) -> None:
-        """Render 2D top-down view of a single intersection pane (480 x 720)."""
-        # TODO [Cao Đức Đạo]: Hoàn thiện đồ họa ngã tư 2D, làn đường và đèn tín hiệu
+        """Render 2D top-down view of a single intersection pane with continuous traffic animation."""
         pygame = self.pygame_module
         if not pygame:
             return
 
-        cx, cy = offset_x + LEFT_PANE_WIDTH // 2, WINDOW_HEIGHT // 2
-        road_width = 120
-
-        # Background pane
-        pygame.draw.rect(surface, COLOR_BG, (offset_x, 0, LEFT_PANE_WIDTH, WINDOW_HEIGHT))
-
-        # Vertical road (North - South)
-        pygame.draw.rect(surface, COLOR_ROAD, (cx - road_width // 2, 0, road_width, WINDOW_HEIGHT))
-        # Horizontal road (East - West)
-        pygame.draw.rect(surface, COLOR_ROAD, (offset_x, cy - road_width // 2, LEFT_PANE_WIDTH, road_width))
-
-        # Stop lines
-        pygame.draw.line(surface, COLOR_ROAD_MARKING, (cx - road_width // 2, cy - road_width // 2), (cx + road_width // 2, cy - road_width // 2), 2)
-        pygame.draw.line(surface, COLOR_ROAD_MARKING, (cx - road_width // 2, cy + road_width // 2), (cx + road_width // 2, cy + road_width // 2), 2)
-        pygame.draw.line(surface, COLOR_ROAD_MARKING, (cx - road_width // 2, cy - road_width // 2), (cx - road_width // 2, cy + road_width // 2), 2)
-        pygame.draw.line(surface, COLOR_ROAD_MARKING, (cx + road_width // 2, cy - road_width // 2), (cx + road_width // 2, cy + road_width // 2), 2)
-
-        # Traffic Signal Indicators
-        is_ns_green = (env.phase == PHASE_NS)
-        color_ns = COLOR_GREEN_LIGHT if is_ns_green else COLOR_RED_LIGHT
-        color_ew = COLOR_RED_LIGHT if is_ns_green else COLOR_GREEN_LIGHT
-
-        # North & South signals
-        pygame.draw.circle(surface, color_ns, (cx, cy - road_width // 2 - 15), 10)
-        pygame.draw.circle(surface, color_ns, (cx, cy + road_width // 2 + 15), 10)
-        # East & West signals
-        pygame.draw.circle(surface, color_ew, (cx + road_width // 2 + 15, cy), 10)
-        pygame.draw.circle(surface, color_ew, (cx - road_width // 2 - 15, cy), 10)
-
-        # Draw Queue Bars & Car Counts
-        for app in APPROACHES:
-            q_len = len(env.queues[app])
-            if app == NORTH:
-                label = f"N: {q_len} cars"
-                pos = (cx - 30, cy - road_width // 2 - 40)
-            elif app == SOUTH:
-                label = f"S: {q_len} cars"
-                pos = (cx - 30, cy + road_width // 2 + 35)
-            elif app == EAST:
-                label = f"E: {q_len} cars"
-                pos = (cx + road_width // 2 + 30, cy - 10)
-            else:
-                label = f"W: {q_len} cars"
-                pos = (cx - road_width // 2 - 90, cy - 10)
-
-            txt = self.fonts["small"].render(label, True, COLOR_TEXT_PRIMARY)
-            surface.blit(txt, pos)
+        renderer = self.renderer_baseline if offset_x == 0 else self.renderer_rl
+        if renderer:
+            renderer.render(surface, env, self.fonts)
 
         # Pane Header Banner
         header_surf = pygame.Surface((LEFT_PANE_WIDTH - 20, 40))
@@ -426,21 +413,47 @@ class SplitScreenStudio:
         self.pygame_module.display.flip()
 
     def run(self, max_steps: Optional[int] = None) -> None:
-        """Execute split-screen interactive visualization loop."""
+        """Execute split-screen interactive visualization loop with continuous vehicle motion."""
         self.is_running = True
         step_idx = 0
+        last_step_ticks = self.pygame_module.time.get_ticks() if self.pygame_module and not self.headless else 0
+        last_frame_ticks = last_step_ticks
 
         while self.is_running:
             if not self.handle_events():
                 break
 
+            now = self.pygame_module.time.get_ticks() if self.pygame_module and not self.headless else 0
+
+            # 1. Update continuous physical animation at 60 FPS
+            if self.pygame_module and not self.headless:
+                dt = (now - last_frame_ticks) / 1000.0
+                last_frame_ticks = now
+                if dt > 0.08:
+                    dt = 0.016
+                if self.renderer_baseline:
+                    self.renderer_baseline.update(dt)
+                if self.renderer_rl:
+                    self.renderer_rl.update(dt)
+
+            # 2. Advance decision steps
             if not self.is_paused:
-                for _ in range(self.sim_speed):
-                    self.step()
-                    step_idx += 1
-                    if max_steps and step_idx >= max_steps:
-                        self.is_running = False
-                        break
+                if self.headless:
+                    for _ in range(self.sim_speed):
+                        self.step()
+                        step_idx += 1
+                        if max_steps and step_idx >= max_steps:
+                            self.is_running = False
+                            break
+                else:
+                    step_interval_ms = max(50, 400 // max(1, self.sim_speed))
+                    if now - last_step_ticks >= step_interval_ms:
+                        self.step()
+                        last_step_ticks = now
+                        step_idx += 1
+                        if max_steps and step_idx >= max_steps:
+                            self.is_running = False
+                            break
 
             self.render()
 
