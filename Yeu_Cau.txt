@@ -1,0 +1,47 @@
+2. YÊU CẦU CHI TIẾT CHO TỪNG FILE TRONG BỘ KHUNG
+1. core/config.py (Viết đầy đủ 100% hằng số từ tài liệu):
+- Hằng số MDP v2.0: STATE_DIM = 10, ACTION_DIM = 2, Q_MAX = 30, W_MAX = 120.0, T_MIN = 10, T_MAX = 60, DELTA_T_GREEN = 5, DELTA_T_YELLOW = 3, SATURATION_FLOW_RATE = 1.0, EPISODE_DURATION = 1800.
+- Trọng số hàm phần thưởng: ALPHA_QUEUE = 1.0, BETA_WAIT_SQ = 1.5, C_SWITCH = 0.25, ETA_PASSED = 0.4, DELTA_V_MAX = 10.0, GAMMA = 0.95.
+- Cấu hình 4 kịch bản chuẩn (SCENARIOS dict): SC1_LOW, SC2_HIGH, SC3_ASYMMETRIC, SC4_DYNAMIC_SURGE đúng theo bảng thiết kế Mục I.5.1.
+- Siêu tham số huấn luyện mặc định cho Q-Learning và Double DQN theo Mục III.2.
+
+2. core/env.py (TrafficLightEnv(gym.Env)):
+Khai báo chính xác:
+- self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(10,), dtype=np.float32)
+- self.action_space = spaces.Discrete(2)
+Khai báo đầy đủ các phương thức với Type Hints và Docstring giải thích công thức toán học:
+- reset(self, *, seed: int | None = None, options: dict | None = None) -> tuple[np.ndarray, dict]
+- step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict]
+- get_action_mask(self) -> np.ndarray (trả về np.ndarray shape (2,) kiểu np.int8)
+- _compute_observation(self) -> np.ndarray
+- _compute_reward(self, action_switched: bool, passed_vehicles: int) -> float
+- _build_info(self, passed_vehicles: int) -> dict
+Bắt buộc: Hàm _build_info() trong bản khung phải trả về một dict có đúng 100% các khóa trong Hợp đồng giao diện (Mục I.4.2):
+{"raw_queues": [0, 0, 0, 0], "max_waits": [0.0, 0.0, 0.0, 0.0], "phase": 0, "phase_duration": 0, "action_mask": np.array([1, 1], dtype=np.int8), "step_passed_vehicles": 0, "total_passed": 0, "avg_wait_time": 0.0}
+Đánh dấu # TODO [Phạm Văn Việt]: Implement ... tại các vị trí cần viết logic chi tiết.
+
+
+3. agents/base_agent.py (BaseAgent(ABC)):
+Định nghĩa giao diện chung mà mọi Agent (Baselines, Q-Learning, DQN/DDQN) bắt buộc phải kế thừa:
+- @abstractmethod def select_action(self, obs: np.ndarray, info: dict, eval_mode: bool = False) -> int:
+- def update(self, obs: np.ndarray, action: int, reward: float, next_obs: np.ndarray, done: bool, info: dict, next_info: dict) -> dict | None:
+- def save(self, filepath: str) -> None:
+- def load(self, filepath: str) -> None:
+
+
+4. agents/baselines.py, agents/q_learning.py, agents/dqn_agent.py:
+- Tạo đầy đủ các class kế thừa từ BaseAgent.
+- Trong q_learning.py: Tạo khung class StateDiscretizer với phương thức transform(self, obs: np.ndarray, info: dict) -> tuple[int, ...] (mô tả rõ quy tắc chia 972 trạng thái ở docstring).
+- Trong dqn_agent.py: Tạo khung QNetwork(nn.Module) (kiến trúc 10 -> 64 -> 64 -> 2), ReplayBuffer, và DQNAgent(BaseAgent) có tham số use_double_dqn: bool = True.
+- Trong các hàm select_action khung, tạm thời trả về một hành động hợp lệ lấy từ info["action_mask"] và gắn thẻ # TODO [Tên thành viên phụ trách]: ... tương ứng theo Bảng phân công Mục II.
+
+
+5. ui/studio_app.py và experiments/benchmark.py:
+- Thiết lập các class và hàm khung cho chế độ Split-Screen A/B Testing ($1280 \times 720$) và bộ chạy Benchmark xuất CSV/Matplotlib, gắn thẻ # TODO [Cao Đức Đạo] và # TODO [Trương Hữu Quang].
+
+6. verify_contract.py (Viết hoàn chỉnh để chạy kiểm tra ngay):
+Viết một script test ngắn khởi tạo TrafficLightEnv, khởi tạo toàn bộ 5 Agents (FixedTimeAgent, MaxPressureAgent, QLearningAgent, DQNAgent(use_double_dqn=False), DQNAgent(use_double_dqn=True)), chạy thử một vòng lặp 10 bước (reset() -> select_action() -> step()) và dùng lệnh assert kiểm tra:
+- obs.shape == (10,) và obs.dtype == np.float32
+- 0.0 <= obs.min() and obs.max() <= 1.0
+- Đầy đủ 8 keys bắt buộc trong info dictionary.
+- action trả về từ mọi Agent luôn tôn trọng info["action_mask"].
