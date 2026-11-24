@@ -141,11 +141,11 @@ class SplitScreenStudio:
 
             # Fonts
             pygame.font.init()
-            self.fonts["title"] = pygame.font.SysFont("Segoe UI, Roboto, Arial", 18, bold=True)
-            self.fonts["body"] = pygame.font.SysFont("Segoe UI, Roboto, Arial", 14)
-            self.fonts["metric"] = pygame.font.SysFont("Segoe UI, Roboto, Arial", 22, bold=True)
-            self.fonts["small"] = pygame.font.SysFont("Segoe UI, Roboto, Arial", 12)
-            self.fonts["bold"] = pygame.font.SysFont("Segoe UI, Roboto, Arial", 12, bold=True)
+            self.fonts["title"] = pygame.font.SysFont("segoeui", 18, bold=True)
+            self.fonts["body"] = pygame.font.SysFont("segoeui", 14)
+            self.fonts["metric"] = pygame.font.SysFont("segoeui", 22, bold=True)
+            self.fonts["small"] = pygame.font.SysFont("segoeui", 12)
+            self.fonts["bold"] = pygame.font.SysFont("segoeui", 12, bold=True)
 
             # Continuous Vehicle Physics Renderers
             self.renderer_baseline = TrafficRenderer(
@@ -153,7 +153,7 @@ class SplitScreenStudio:
                 offset_y=0,
                 panel_w=LEFT_PANE_WIDTH,
                 panel_h=WINDOW_HEIGHT,
-                road_w=120,
+                road_w=126,
             )
             self.renderer_baseline.reset(self.env_baseline)
 
@@ -162,7 +162,7 @@ class SplitScreenStudio:
                 offset_y=0,
                 panel_w=MID_PANE_WIDTH,
                 panel_h=WINDOW_HEIGHT,
-                road_w=120,
+                road_w=126,
             )
             self.renderer_rl.reset(self.env_rl)
         except Exception as e:
@@ -254,22 +254,22 @@ class SplitScreenStudio:
         if x0 + 15 <= x <= x0 + RIGHT_PANE_WIDTH - 15:
             sc_list = ["SC1_LOW", "SC2_HIGH", "SC3_ASYMMETRIC", "SC4_DYNAMIC_SURGE"]
             for idx, sc_id in enumerate(sc_list):
-                btn_y = 520 + idx * 36
-                if btn_y <= y <= btn_y + 30:
+                btn_y = 440 + idx * 38
+                if btn_y <= y <= btn_y + 32:
                     self.setup_environments(sc_id, self.seed)
                     return
 
             # Speed buttons
-            if 670 <= y <= 700:
-                btn_w = (RIGHT_PANE_WIDTH - 30) // 4
+            if 634 <= y <= 671:
+                btn_w = 54
                 for idx, spd in enumerate([1, 2, 5, 10]):
-                    bx = x0 + 15 + idx * btn_w
+                    bx = x0 + 15 + idx * (btn_w + 7)
                     if bx <= x <= bx + btn_w:
                         self.sim_speed = spd
                         return
 
     def render_intersection(self, surface: Any, offset_x: int, env: TrafficLightEnv, title: str, accent_color: tuple[int, int, int]) -> None:
-        """Render 2D top-down view of a single intersection pane with continuous traffic animation."""
+        """Render one isometric intersection and its comparison header."""
         pygame = self.pygame_module
         if not pygame:
             return
@@ -278,109 +278,103 @@ class SplitScreenStudio:
         if renderer:
             renderer.render(surface, env, self.fonts)
 
-        # Pane Header Banner
-        header_surf = pygame.Surface((LEFT_PANE_WIDTH - 20, 40))
-        header_surf.fill((30, 36, 50))
-        surface.blit(header_surf, (offset_x + 10, 10))
-        pygame.draw.line(surface, accent_color, (offset_x + 10, 50), (offset_x + LEFT_PANE_WIDTH - 10, 50), 3)
-
+        header_rect = pygame.Rect(offset_x + 12, 10, LEFT_PANE_WIDTH - 24, 42)
+        pygame.draw.rect(surface, (22, 34, 49), header_rect, border_radius=10)
+        pygame.draw.rect(surface, accent_color, header_rect, 1, border_radius=10)
+        pygame.draw.circle(surface, accent_color, (offset_x + 28, 31), 5)
         title_txt = self.fonts["title"].render(title, True, COLOR_TEXT_PRIMARY)
-        surface.blit(title_txt, (offset_x + 20, 18))
+        surface.blit(title_txt, (offset_x + 42, 20))
+        mode_txt = self.fonts["small"].render("LIVE · A/B TEST", True, COLOR_TEXT_MUTED)
+        surface.blit(mode_txt, (offset_x + LEFT_PANE_WIDTH - 133, 24))
 
         # Pane Border
-        pygame.draw.line(surface, COLOR_PANE_BORDER, (offset_x + LEFT_PANE_WIDTH, 0), (offset_x + LEFT_PANE_WIDTH, WINDOW_HEIGHT), 2)
+        pygame.draw.line(surface, COLOR_PANE_BORDER,
+                         (offset_x + LEFT_PANE_WIDTH, 0),
+                         (offset_x + LEFT_PANE_WIDTH, WINDOW_HEIGHT), 1)
 
     def render_telemetry_panel(self, surface: Any) -> None:
-        """Render Right Telemetry Dashboard (320 x 720)."""
-        # TODO [Cao Đức Đạo]: Hoàn thiện bảng Live Delta và nút điều khiển tương tác
+        """Draw compact live metrics and controls in the fixed 280px sidebar."""
         pygame = self.pygame_module
         if not pygame:
             return
 
         x0 = LEFT_PANE_WIDTH + MID_PANE_WIDTH
-        panel_rect = (x0, 0, RIGHT_PANE_WIDTH, WINDOW_HEIGHT)
-        pygame.draw.rect(surface, (24, 28, 42), panel_rect)
+        pygame.draw.rect(surface, (15, 23, 36), (x0, 0, RIGHT_PANE_WIDTH, WINDOW_HEIGHT))
+        pygame.draw.line(surface, (48, 66, 83), (x0, 0), (x0, WINDOW_HEIGHT), 1)
 
-        # Header
-        head_txt = self.fonts["title"].render("TELEMETRY & A/B DELTA", True, COLOR_TEXT_PRIMARY)
-        surface.blit(head_txt, (x0 + 15, 18))
-        pygame.draw.line(surface, (60, 70, 95), (x0 + 15, 45), (x0 + RIGHT_PANE_WIDTH - 15, 45), 2)
+        def label(text: str, x: int, y: int, color: tuple[int, int, int], font: str = "small") -> None:
+            surface.blit(self.fonts[font].render(text, True, color), (x, y))
 
-        # Elapsed Time & Scenario
-        sim_time_sec = float(self.env_rl.current_time)
-        mins = int(sim_time_sec // 60)
-        secs = int(sim_time_sec % 60)
-        time_str = f"Time: {mins:02d}:{secs:02d} / 30:00"
-        time_txt = self.fonts["body"].render(time_str, True, COLOR_TEXT_MUTED)
-        surface.blit(time_txt, (x0 + 15, 55))
+        label("LIVE TELEMETRY", x0 + 15, 17, COLOR_TEXT_PRIMARY, "title")
+        pygame.draw.line(surface, (48, 66, 83), (x0 + 15, 45), (x0 + RIGHT_PANE_WIDTH - 15, 45), 1)
+        elapsed = int(self.env_rl.current_time)
+        label(f"SIM TIME   {elapsed // 60:02d}:{elapsed % 60:02d} / 30:00", x0 + 15, 57, COLOR_TEXT_MUTED, "body")
+        scenario = SCENARIOS.get(self.scenario_id)
+        label(scenario.name if scenario else self.scenario_id, x0 + 15, 80, (244, 196, 104))
 
-        sc_name = SCENARIOS.get(self.scenario_id, None)
-        sc_desc = sc_name.name if sc_name else self.scenario_id
-        sc_txt = self.fonts["body"].render(f"Scenario: {self.scenario_id}", True, (244, 208, 63))
-        surface.blit(sc_txt, (x0 + 15, 75))
+        def card(y: int, title: str) -> None:
+            rect = pygame.Rect(x0 + 12, y, RIGHT_PANE_WIDTH - 24, 91)
+            pygame.draw.rect(surface, (25, 37, 52), rect, border_radius=10)
+            pygame.draw.rect(surface, (47, 66, 83), rect, 1, border_radius=10)
+            label(title, rect.x + 11, rect.y + 9, COLOR_TEXT_MUTED)
 
-        # Metrics: Average Wait Time & Delta
         wait_base = float(self.info_baseline.get("avg_wait_time", 0.0))
         wait_rl = float(self.info_rl.get("avg_wait_time", 0.0))
         delta_wait = wait_rl - wait_base
+        passed_base = int(self.info_baseline.get("total_passed", 0))
+        passed_rl = int(self.info_rl.get("total_passed", 0))
+        delta_passed = passed_rl - passed_base
 
-        # Passed Vehicles & Delta
-        pass_base = int(self.info_baseline.get("total_passed", 0))
-        pass_rl = int(self.info_rl.get("total_passed", 0))
-        delta_pass = pass_rl - pass_base
+        card(108, "AVG WAIT  ·  SECONDS")
+        label("BASE", x0 + 23, 139, COLOR_ACCENT_BASELINE)
+        label(f"{wait_base:.1f}s", x0 + 66, 137, COLOR_TEXT_PRIMARY, "body")
+        label("RL", x0 + 23, 164, COLOR_ACCENT_RL)
+        label(f"{wait_rl:.1f}s", x0 + 66, 162, COLOR_TEXT_PRIMARY, "body")
+        label(f"Δ {delta_wait:+.1f}s", x0 + 157, 151,
+              COLOR_GREEN_LIGHT if delta_wait <= 0 else COLOR_RED_LIGHT, "body")
 
-        y_off = 110
-        # Telemetry Card 1: Wait Time
-        pygame.draw.rect(surface, (32, 38, 56), (x0 + 15, y_off, RIGHT_PANE_WIDTH - 30, 85), border_radius=6)
-        surface.blit(self.fonts["small"].render("AVG VEHICLE WAIT TIME (s)", True, COLOR_TEXT_MUTED), (x0 + 25, y_off + 8))
-        surface.blit(self.fonts["body"].render(f"Baseline: {wait_base:5.1f}s", True, COLOR_ACCENT_BASELINE), (x0 + 25, y_off + 28))
-        surface.blit(self.fonts["body"].render(f"RL Agent: {wait_rl:5.1f}s", True, COLOR_ACCENT_RL), (x0 + 25, y_off + 48))
+        card(208, "VEHICLES DISCHARGED")
+        label("BASE", x0 + 23, 239, COLOR_ACCENT_BASELINE)
+        label(str(passed_base), x0 + 66, 237, COLOR_TEXT_PRIMARY, "body")
+        label("RL", x0 + 23, 264, COLOR_ACCENT_RL)
+        label(str(passed_rl), x0 + 66, 262, COLOR_TEXT_PRIMARY, "body")
+        label(f"Δ {delta_passed:+d}", x0 + 157, 251,
+              COLOR_GREEN_LIGHT if delta_passed >= 0 else COLOR_RED_LIGHT, "body")
 
-        delta_color = COLOR_GREEN_LIGHT if delta_wait <= 0 else COLOR_RED_LIGHT
-        delta_wait_txt = self.fonts["metric"].render(f"Delta: {delta_wait:+4.1f}s", True, delta_color)
-        surface.blit(delta_wait_txt, (x0 + 160, y_off + 35))
-
-        y_off += 95
-        # Telemetry Card 2: Total Passed Vehicles
-        pygame.draw.rect(surface, (32, 38, 56), (x0 + 15, y_off, RIGHT_PANE_WIDTH - 30, 85), border_radius=6)
-        surface.blit(self.fonts["small"].render("TOTAL DISCHARGED VEHICLES", True, COLOR_TEXT_MUTED), (x0 + 25, y_off + 8))
-        surface.blit(self.fonts["body"].render(f"Baseline: {pass_base} veh", True, COLOR_ACCENT_BASELINE), (x0 + 25, y_off + 28))
-        surface.blit(self.fonts["body"].render(f"RL Agent: {pass_rl} veh", True, COLOR_ACCENT_RL), (x0 + 25, y_off + 48))
-
-        delta_p_color = COLOR_GREEN_LIGHT if delta_pass >= 0 else COLOR_RED_LIGHT
-        delta_pass_txt = self.fonts["metric"].render(f"Delta: {delta_pass:+d}", True, delta_p_color)
-        surface.blit(delta_pass_txt, (x0 + 160, y_off + 35))
-
-        y_off += 95
-        # Action Mask Status Card
         mask_base = self.info_baseline.get("action_mask", np.array([1, 1]))
         mask_rl = self.info_rl.get("action_mask", np.array([1, 1]))
-        pygame.draw.rect(surface, (32, 38, 56), (x0 + 15, y_off, RIGHT_PANE_WIDTH - 30, 75), border_radius=6)
-        surface.blit(self.fonts["small"].render("CURRENT ACTION MASKS [Keep, Switch]", True, COLOR_TEXT_MUTED), (x0 + 25, y_off + 8))
-        surface.blit(self.fonts["body"].render(f"Baseline: {list(mask_base)}", True, COLOR_TEXT_PRIMARY), (x0 + 25, y_off + 28))
-        surface.blit(self.fonts["body"].render(f"RL Agent: {list(mask_rl)}", True, COLOR_TEXT_PRIMARY), (x0 + 25, y_off + 48))
+        card(308, "PHASE  ·  MASK [KEEP, SWITCH]")
+        phase_base = "N—S" if self.env_baseline.phase == PHASE_NS else "E—W"
+        phase_rl = "N—S" if self.env_rl.phase == PHASE_NS else "E—W"
+        label(f"BASE  {phase_base} {self.env_baseline.phase_duration:.0f}s  {list(mask_base)}",
+              x0 + 22, 340, COLOR_ACCENT_BASELINE)
+        label(f"RL      {phase_rl} {self.env_rl.phase_duration:.0f}s  {list(mask_rl)}",
+              x0 + 22, 367, COLOR_ACCENT_RL)
 
-        # Scenario Selection Buttons
-        surface.blit(self.fonts["small"].render("SELECT SCENARIO (CLICK OR KEYS 1-4)", True, COLOR_TEXT_MUTED), (x0 + 15, 500))
-        sc_keys = ["SC1_LOW", "SC2_HIGH", "SC3_ASYMMETRIC", "SC4_DYNAMIC_SURGE"]
-        for idx, sc_id in enumerate(sc_keys):
-            btn_y = 520 + idx * 36
-            btn_active = (self.scenario_id == sc_id)
-            btn_bg = (59, 130, 246) if btn_active else (40, 48, 68)
-            pygame.draw.rect(surface, btn_bg, (x0 + 15, btn_y, RIGHT_PANE_WIDTH - 30, 30), border_radius=4)
-            label = f"{sc_id}: {SCENARIOS[sc_id].name}"
-            txt = self.fonts["body"].render(label, True, (255, 255, 255))
-            surface.blit(txt, (x0 + 25, btn_y + 6))
+        label("SCENARIO  ·  KEYS 1–4", x0 + 15, 415, COLOR_TEXT_MUTED)
+        scenario_ids = ["SC1_LOW", "SC2_HIGH", "SC3_ASYMMETRIC", "SC4_DYNAMIC_SURGE"]
+        for idx, scenario_id in enumerate(scenario_ids):
+            y = 440 + idx * 38
+            active = self.scenario_id == scenario_id
+            rect = pygame.Rect(x0 + 15, y, RIGHT_PANE_WIDTH - 30, 32)
+            pygame.draw.rect(surface, (36, 65, 86) if active else (25, 37, 52), rect, border_radius=8)
+            pygame.draw.rect(surface, COLOR_ACCENT_RL if active else (47, 66, 83), rect, 1, border_radius=8)
+            label(f"{idx + 1}   {SCENARIOS[scenario_id].name}", rect.x + 11, rect.y + 8,
+                  COLOR_TEXT_PRIMARY, "body")
 
-        # Speed Multiplier Buttons
-        surface.blit(self.fonts["small"].render("SIMULATION SPEED (SPACE = PAUSE)", True, COLOR_TEXT_MUTED), (x0 + 15, 665))
-        for i, spd in enumerate([1, 2, 5, 10]):
-            btn_x = x0 + 15 + i * 72
-            btn_active = (self.sim_speed == spd)
-            btn_bg = (168, 85, 247) if btn_active else (40, 48, 68)
-            pygame.draw.rect(surface, btn_bg, (btn_x, 685, 65, 25), border_radius=4)
-            txt = self.fonts["body"].render(f"{spd}x", True, (255, 255, 255))
-            surface.blit(txt, (btn_x + 20, 688))
+        label("SPEED  ·  SPACE TO PAUSE", x0 + 15, 605, COLOR_TEXT_MUTED)
+        for idx, speed in enumerate([1, 2, 5, 10]):
+            rect = pygame.Rect(x0 + 15 + idx * 61, 634, 54, 36)
+            active = self.sim_speed == speed
+            pygame.draw.rect(surface, (43, 77, 96) if active else (25, 37, 52), rect, border_radius=8)
+            pygame.draw.rect(surface, COLOR_ACCENT_RL if active else (47, 66, 83), rect, 1, border_radius=8)
+            txt = self.fonts["body"].render(f"{speed}x", True, COLOR_TEXT_PRIMARY)
+            surface.blit(txt, (rect.centerx - txt.get_width() // 2,
+                               rect.centery - txt.get_height() // 2))
+
+        status = "PAUSED" if self.is_paused else "RUNNING"
+        status_color = (246, 190, 92) if self.is_paused else (89, 210, 151)
+        label(f"●  {status}   ·   SEED {self.seed}", x0 + 15, 689, status_color)
 
     def render(self) -> None:
         """Render complete studio frame to screen."""
