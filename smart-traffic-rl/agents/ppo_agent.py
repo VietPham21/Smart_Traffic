@@ -5,8 +5,10 @@ Implements Policy-Based / Actor-Critic RL algorithm tailored for TrafficLightEnv
    MLPs with Tanh activations and Orthogonal Weight Initialization.
 2. Masked Categorical Policy: Strictly applies action masking via
    masked_logits = logits + (1 - m_t) * (-1e9).
-3. RolloutBuffer & Generalized Advantage Estimation (GAE, gamma=0.95, lambda=0.95).
-4. PPO-Clip Clipped Surrogate Objective + Value Function Loss + Entropy Bonus.
+3. RolloutBuffer & Generalized Advantage Estimation (GAE, gamma=0.95, lambda=0.95)
+   with proper separation of terminated vs truncated episode boundaries.
+4. PPO-Clip Clipped Surrogate Objective (masked over valid multi-choice steps)
+   + SmoothL1 (Huber) Value Function Loss + Entropy Bonus + Linear LR Annealing.
 5. Serialization (.pth) and Inference ONNX Export ((obs, action_mask) -> (action_probs, deterministic_action)).
 """
 
@@ -25,7 +27,6 @@ from torch.distributions import Categorical
 from core.config import (
     STATE_DIM,
     ACTION_DIM,
-    ACTION_KEEP,
     PPO_CONFIG,
 )
 from .base_agent import BaseAgent
@@ -98,15 +99,17 @@ class PPOOnnxWrapper(nn.Module):
 
 
 class RolloutBuffer:
-    """On-policy trajectory storage supporting Generalized Advantage Estimation (GAE)."""
+    """On-policy trajectory storage supporting GAE with terminated vs truncated separation."""
 
     def __init__(self) -> None:
         self.states: list[np.ndarray] = []
         self.actions: list[int] = []
         self.log_probs: list[float] = []
         self.rewards: list[float] = []
-        self.dones: list[bool] = []
+        self.terminateds: list[bool] = []
+        self.truncateds: list[bool] = []
         self.values: list[float] = []
+        self.next_values: list[float] = []
         self.action_masks: list[np.ndarray] = []
 
     def push(
@@ -115,16 +118,20 @@ class RolloutBuffer:
         action: int,
         log_prob: float,
         reward: float,
-        done: bool,
+        terminated: bool,
+        truncated: bool,
         value: float,
+        next_value: float,
         action_mask: np.ndarray,
     ) -> None:
         self.states.append(np.array(state, dtype=np.float32))
         self.actions.append(int(action))
         self.log_probs.append(float(log_prob))
         self.rewards.append(float(reward))
-        self.dones.append(bool(done))
+        self.terminateds.append(bool(terminated))
+        self.truncateds.append(bool(truncated))
         self.values.append(float(value))
+        self.next_values.append(float(next_value))
         self.action_masks.append(np.array(action_mask, dtype=np.float32))
 
     def clear(self) -> None:
@@ -132,8 +139,10 @@ class RolloutBuffer:
         self.actions.clear()
         self.log_probs.clear()
         self.rewards.clear()
-        self.dones.clear()
+        self.terminateds.clear()
+        self.truncateds.clear()
         self.values.clear()
+        self.next_values.clear()
         self.action_masks.clear()
 
     def __len__(self) -> int:
@@ -145,20 +154,31 @@ class RolloutBuffer:
         gamma: float,
         gae_lambda: float,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Compute discounted returns R_hat_t and GAE advantages A_hat_t."""
+        """Compute discounted returns R_hat_t and GAE advantages A_hat_t.
+
+        Properly handles episode boundaries inside multi-episode rollouts:
+        - terminated[t] == True: next_val = 0.0, gae_mask = 0.0 (absorbing end)
+        - truncated[t]  == True: next_val = next_values[t] = V(next_obs_t), gae_mask = 0.0
+          (bootstraps continuing value while stopping advantage leak into next episode)
+        - otherwise: next_val = last_value (at n-1) or values[t+1], gae_mask = 1.0
+        """
         n = len(self.states)
         advantages = np.zeros(n, dtype=np.float32)
         last_gae = 0.0
 
         for t in reversed(range(n)):
-            if t == n - 1:
-                next_value = last_value
+            if self.terminateds[t]:
+                next_val = 0.0
+                gae_mask = 0.0
+            elif self.truncateds[t]:
+                next_val = self.next_values[t]
+                gae_mask = 0.0
             else:
-                next_value = self.values[t + 1]
+                next_val = last_value if t == n - 1 else self.values[t + 1]
+                gae_mask = 1.0
 
-            non_terminal = 0.0 if self.dones[t] else 1.0
-            delta = self.rewards[t] + gamma * non_terminal * next_value - self.values[t]
-            last_gae = delta + gamma * gae_lambda * non_terminal * last_gae
+            delta = self.rewards[t] + gamma * next_val - self.values[t]
+            last_gae = delta + gamma * gae_lambda * gae_mask * last_gae
             advantages[t] = last_gae
 
         values_arr = np.asarray(self.values, dtype=np.float32)
@@ -187,6 +207,7 @@ class PPOAgent(BaseAgent):
     ) -> None:
         super().__init__(name=name)
 
+        self.initial_lr: float = float(lr)
         self.gamma: float = float(gamma)
         self.gae_lambda: float = float(gae_lambda)
         self.clip_eps: float = float(clip_eps)
@@ -208,7 +229,8 @@ class PPOAgent(BaseAgent):
             action_dim=ACTION_DIM,
         ).to(self.device)
 
-        self.optimizer: optim.Optimizer = optim.Adam(self.network.parameters(), lr=lr, eps=1e-5)
+        self.optimizer: optim.Optimizer = optim.Adam(self.network.parameters(), lr=self.initial_lr, eps=1e-5)
+        self.value_loss_fn: nn.Module = nn.SmoothL1Loss(beta=1.0)
         self.rollout_buffer: RolloutBuffer = RolloutBuffer()
 
         # Temporary cache bridging select_action() -> update()
@@ -217,6 +239,14 @@ class PPOAgent(BaseAgent):
         self._last_mask: Optional[np.ndarray] = None
         self._last_obs_cache: Optional[np.ndarray] = None
         self.total_steps: int = 0
+
+    def set_lr_progress(self, progress: float) -> float:
+        """Linearly anneal learning rate from initial_lr down to 0.1 * initial_lr."""
+        clamped = float(np.clip(progress, 0.0, 1.0))
+        new_lr = self.initial_lr * (1.0 - 0.9 * clamped)
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = new_lr
+        return float(new_lr)
 
     def reset(self) -> None:
         """Reset transient per-step action cache at episode boundaries."""
@@ -276,6 +306,13 @@ class PPOAgent(BaseAgent):
             chosen = int(valid_actions[0])
         return chosen
 
+    def _eval_state_value(self, obs: np.ndarray) -> float:
+        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        self.network.eval()
+        with torch.no_grad():
+            _, val_t = self.network(obs_t)
+            return float(val_t.squeeze().item())
+
     def update(
         self,
         obs: np.ndarray,
@@ -285,14 +322,14 @@ class PPOAgent(BaseAgent):
         done: bool,
         info: dict[str, Any],
         next_info: dict[str, Any],
+        truncated: bool = False,
     ) -> dict[str, Any] | None:
-        """Store step transition into RolloutBuffer and trigger PPO optimization when buffer is full."""
+        """Store transition with explicit terminated vs truncated flags and trigger PPO optimization."""
         action_mask = np.asarray(
             info.get("action_mask", np.array([1, 1], dtype=np.int8)),
             dtype=np.float32,
         )
 
-        # Reuse cached log_prob / value from select_action if available, otherwise compute cleanly
         if (
             self._last_log_prob is not None
             and self._last_value is not None
@@ -313,51 +350,65 @@ class PPOAgent(BaseAgent):
                 value = float(val_t.item())
             stored_mask = action_mask
 
+        is_truncated = bool(truncated or next_info.get("is_truncated", False))
+        is_terminated = bool(done and not is_truncated)
+
+        # Evaluate true bootstrap value V(next_obs) whenever episode is cut by time limit (truncated=True)
+        next_val = self._eval_state_value(next_obs) if is_truncated else 0.0
+
         self.rollout_buffer.push(
             state=obs,
             action=int(action),
             log_prob=log_prob,
             reward=float(reward),
-            done=bool(done),
+            terminated=is_terminated,
+            truncated=is_truncated,
             value=value,
+            next_value=next_val,
             action_mask=stored_mask,
         )
         self.total_steps += 1
 
-        # Clear transient single-step cache
         self._last_log_prob = None
         self._last_value = None
         self._last_mask = None
         self._last_obs_cache = None
 
         if len(self.rollout_buffer) >= self.rollout_steps:
-            return self._optimize(last_next_obs=next_obs, last_done=done)
+            return self._optimize(
+                last_next_obs=next_obs,
+                last_terminated=is_terminated,
+                last_truncated=is_truncated,
+            )
         return None
 
     def flush_update(
         self,
         last_next_obs: Optional[np.ndarray] = None,
         last_done: bool = True,
+        last_truncated: bool = False,
     ) -> dict[str, Any] | None:
-        """Force a PPO update on remaining buffered transitions (useful at end of short training runs)."""
+        """Force a PPO update on remaining buffered transitions."""
         if len(self.rollout_buffer) == 0:
             return None
-        return self._optimize(last_next_obs=last_next_obs, last_done=last_done)
+        last_terminated = bool(last_done and not last_truncated)
+        return self._optimize(
+            last_next_obs=last_next_obs,
+            last_terminated=last_terminated,
+            last_truncated=bool(last_truncated),
+        )
 
     def _optimize(
         self,
         last_next_obs: Optional[np.ndarray],
-        last_done: bool,
+        last_terminated: bool,
+        last_truncated: bool = False,
     ) -> dict[str, float]:
         """Compute GAE returns and run PPO-Clip gradient updates over collected rollout."""
-        if last_next_obs is None or last_done:
+        if last_next_obs is None or last_terminated:
             last_value = 0.0
         else:
-            next_t = torch.tensor(last_next_obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-            self.network.eval()
-            with torch.no_grad():
-                _, val_t = self.network(next_t)
-                last_value = float(val_t.squeeze().item())
+            last_value = self._eval_state_value(last_next_obs)
 
         returns_np, adv_np = self.rollout_buffer.compute_returns_and_advantages(
             last_value=last_value,
@@ -378,6 +429,7 @@ class PPOAgent(BaseAgent):
         policy_losses: list[float] = []
         value_losses: list[float] = []
         entropies: list[float] = []
+        approx_kls: list[float] = []
 
         self.network.train()
         for _ in range(self.ppo_epochs):
@@ -394,20 +446,37 @@ class PPOAgent(BaseAgent):
                 mb_returns = returns_t[mb_idx]
                 mb_adv = advantages_t[mb_idx]
 
-                # Normalize advantages per mini-batch
-                if mb_adv.numel() > 1:
-                    mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std(unbiased=False) + 1e-8)
+                # Mask steps where agent genuinely had >= 2 legal actions (prevents T_MIN/T_MAX dilution)
+                choice_mask = (mb_masks.sum(dim=-1) > 1.5)
+                has_choices = bool(choice_mask.any().item())
+
+                if has_choices:
+                    sel_adv = mb_adv[choice_mask]
+                    if sel_adv.numel() > 1:
+                        sel_adv = (sel_adv - sel_adv.mean()) / (sel_adv.std(unbiased=False) + 1e-8)
 
                 dist, _, values = self._compute_masked_dist(mb_states, mb_masks)
                 new_lp = dist.log_prob(mb_actions)
-                entropy = dist.entropy().mean()
 
-                ratio = torch.exp(new_lp - mb_old_lp)
-                surr1 = ratio * mb_adv
-                surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * mb_adv
+                if has_choices:
+                    sel_new_lp = new_lp[choice_mask]
+                    sel_old_lp = mb_old_lp[choice_mask]
+                    log_ratio = sel_new_lp - sel_old_lp
+                    ratio = torch.exp(log_ratio)
 
-                policy_loss = -torch.min(surr1, surr2).mean()
-                value_loss = ((values - mb_returns) ** 2).mean()
+                    surr1 = ratio * sel_adv
+                    surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * sel_adv
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                    entropy = dist.entropy()[choice_mask].mean()
+
+                    with torch.no_grad():
+                        kl_est = ((ratio - 1.0) - log_ratio).mean()
+                        approx_kls.append(float(kl_est.item()))
+                else:
+                    policy_loss = torch.zeros((), dtype=torch.float32, device=self.device)
+                    entropy = torch.zeros((), dtype=torch.float32, device=self.device)
+
+                value_loss = self.value_loss_fn(values, mb_returns)
                 total_loss = (
                     policy_loss
                     + self.value_coef * value_loss
@@ -429,6 +498,7 @@ class PPOAgent(BaseAgent):
             "policy_loss": float(np.mean(policy_losses)) if policy_losses else 0.0,
             "value_loss": float(np.mean(value_losses)) if value_losses else 0.0,
             "entropy": float(np.mean(entropies)) if entropies else 0.0,
+            "approx_kl": float(np.mean(approx_kls)) if approx_kls else 0.0,
         }
 
     def save(self, filepath: str) -> None:

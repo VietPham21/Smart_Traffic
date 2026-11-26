@@ -107,13 +107,14 @@ ACTION_SWITCH: Final[int] = Action.SWITCH
 
 
 # ==============================================================================
-# 4. REWARD FUNCTION COEFFICIENTS (Yeu_Cau.txt Exact Specifications)
+# 4. REWARD FUNCTION COEFFICIENTS (Normalized Semi-MDP Specification)
 # ==============================================================================
 # Formula:
-# R_t = - ALPHA_QUEUE * sum(Q_i)
-#       - BETA_WAIT_SQ * sum((W_i / W_MAX)^2)
-#       - C_SWITCH * 1(action_switched)
-#       + ETA_PASSED * passed_vehicles
+# time_scale = dt_step / DELTA_T_GREEN  (1.0 for 5s keep, 1.6 for 8s switch)
+# r_t = - ( time_scale * [ ALPHA_QUEUE * sum(Q_i / Q_MAX)
+#                        + BETA_WAIT_SQ * sum((W_i / W_MAX)^2) ]
+#         + C_SWITCH * 1(action_switched) )
+#       + ETA_PASSED * (passed_vehicles / DELTA_V_MAX)
 
 ALPHA_QUEUE: Final[float] = 1.0            # Trọng số phạt tổng độ dài hàng đợi ùn ứ
 BETA_WAIT_SQ: Final[float] = 1.5           # Trọng số phạt bình phương thời gian chờ (chống đói đèn)
@@ -302,9 +303,9 @@ PPO_CONFIG: Final[dict[str, Any]] = {
     "entropy_coef": 0.01,
     "value_coef": 0.5,
     "max_grad_norm": 0.5,
-    "ppo_epochs": 4,
+    "ppo_epochs": 8,
     "mini_batch_size": 64,
-    "rollout_steps": 2048,
+    "rollout_steps": 1024,
     "num_episodes": 500,
 }
 

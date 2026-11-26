@@ -56,6 +56,7 @@ class BaseAgent(ABC):
         done: bool,
         info: dict[str, Any],
         next_info: dict[str, Any],
+        truncated: bool = False,
     ) -> dict[str, Any] | None:
         """Perform policy update or replay buffer insertion based on transition experience.
 

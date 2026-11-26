@@ -255,13 +255,16 @@ class DQNAgent(BaseAgent):
         done: bool,
         info: dict[str, Any],
         next_info: dict[str, Any],
+        truncated: bool = False,
     ) -> dict[str, Any] | None:
         """Store experience and train network on mini-batch when buffer is ready."""
-        # TODO [Vũ Bá Đài]: Cập nhật mạng nơ-ron qua Mini-batch và Decoupled Double DQN target
         next_action_mask = next_info.get("action_mask", np.array([1, 1], dtype=np.int8))
+        is_truncated = bool(truncated or next_info.get("is_truncated", False))
+        # Only absorbing terminal transitions zero out future bootstrap value; time-limit truncations bootstrap V/Q!
+        bootstrap_done = bool(done and not is_truncated)
 
         # 1. Store transition in replay buffer
-        self.replay_buffer.push(obs, action, reward, next_obs, done, next_action_mask)
+        self.replay_buffer.push(obs, action, reward, next_obs, bootstrap_done, next_action_mask)
         self.total_steps += 1
 
         # Check warm-up condition

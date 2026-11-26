@@ -10,6 +10,10 @@ env/
 ENV/
 smart-traffic-rl/.venv/
 
+# Training logs & TensorBoard events
+runs/
+smart-traffic-rl/runs/
+
 # Temporary extraction files
 docx_extracted/
 extract.ps1

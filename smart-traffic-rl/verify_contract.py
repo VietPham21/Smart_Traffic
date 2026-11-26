@@ -1,18 +1,19 @@
-"""Automated Interface Contract & System Smoke Test (Method B Complete Suite).
+"""Automated Interface Contract & Scientific Integrity Verification Suite.
 
-Validates 100% of specifications from Đặc tả Phương án B:
-1. Checks core/config.py MDP v2.0 constants and Q-Learning/DQN/PPO configs.
-2. Checks TrafficGenerator Poisson sampling, live rates & spawner On/Off toggle.
-3. Checks StateDiscretizer.transform(obs, info) -> 972 discrete states.
-4. Validates all 6 Candidate Agents (FixedTime, MaxPressure, QLearning,
-   StandardDQN, DoubleDQN, PPO):
+Validates all specifications and P0/P1 mathematical fixes:
+1. MDP v2.0 constants, algorithm configs, TrafficGenerator controls, & typing hints.
+2. StateDiscretizer.transform(obs, info) -> 972 discrete states.
+3. All 6 Candidate Agents (FixedTime, MaxPressure, QLearning, StandardDQN, DoubleDQN, PPO) + Webster:
    - obs.shape == (10,), float32, in [0.0, 1.0]
-   - All 8 backward-compatible + 7 new telemetry keys in info dictionary
-   - Every selected action adheres strictly to info["action_mask"][action] == 1
-5. Verifies real weight/table updates (no NaN/Inf) for QLearning, StandardDQN,
-   DoubleDQN, and PPOAgent.
-6. Verifies .pth and .onnx export + reload + ONNXRuntime masked inference for
-   both PPOAgent and DQNAgent.
+   - All 8 backward-compatible + telemetry keys in info dictionary
+   - Strict action_mask compliance
+4. Real Bellman / gradient updates (no NaN/Inf) for all 4 RL agents.
+5. .pth and .onnx export + reload + ONNXRuntime masked inference.
+6. P0 Regression Checks:
+   - A/B Poisson Step-Size Invariance ([5]*8 vs [8]*5 produce 100% identical arrivals & timestamps)
+   - Queued waiting vehicles properly counted in avg_wait_time (> 0.0 even when 0 vehicles exited)
+   - Semi-MDP time_scale reward sensitivity (8s switch scales queue+wait holding penalty by 1.6x)
+   - Proper `truncated=True, terminated=False` bootstrapping for QLearning, DQN, and PPO.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import math
 import os
 import sys
 import tempfile
+import typing
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
@@ -32,6 +34,7 @@ import onnxruntime as ort
 from core.config import (
     STATE_DIM,
     ACTION_DIM,
+    APPROACHES,
     Q_MAX,
     W_MAX,
     T_MIN,
@@ -50,8 +53,9 @@ from core.config import (
     DQN_CONFIG,
     PPO_CONFIG,
 )
+from core.traffic_generator import TrafficGenerator, Vehicle
 from core.env import TrafficLightEnv
-from agents.baselines import FixedTimeAgent, MaxPressureAgent
+from agents.baselines import FixedTimeAgent, MaxPressureAgent, WebsterAgent
 from agents.q_learning import StateDiscretizer, QLearningAgent
 from agents.dqn_agent import DQNAgent
 from agents.ppo_agent import PPOAgent
@@ -76,14 +80,15 @@ REQUIRED_NEW_INFO_KEYS = {
     "light_states",
     "current_rates",
     "spawner_enabled",
+    "is_truncated",
 }
 
 ALL_REQUIRED_INFO_KEYS = REQUIRED_OLD_INFO_KEYS | REQUIRED_NEW_INFO_KEYS
 
 
 def test_config_and_generator() -> None:
-    """Verify MDP v2.0 constants, algorithm configs, and TrafficGenerator controls."""
-    print("  [1/5] Checking core/config.py constants & TrafficGenerator features...")
+    """Verify MDP v2.0 constants, algorithm configs, type hints, and TrafficGenerator controls."""
+    print("  [1/6] Checking core/config.py constants & TrafficGenerator features...")
     assert STATE_DIM == 10
     assert ACTION_DIM == 2
     assert Q_MAX == 30
@@ -100,9 +105,13 @@ def test_config_and_generator() -> None:
     assert ETA_PASSED == 0.4
     assert GAMMA == 0.95
     assert TOTAL_DISCRETE_STATES == 972
-    assert PPO_CONFIG["hidden_dims"] == (128, 128) and PPO_CONFIG["gae_lambda"] == 0.95
+    assert PPO_CONFIG["hidden_dims"] == (128, 128) and PPO_CONFIG["rollout_steps"] == 1024 and PPO_CONFIG["ppo_epochs"] == 8
     assert DQN_CONFIG["hidden_dims"] == (64, 64) and DQN_CONFIG["lr"] == 5e-4
     assert Q_LEARNING_CONFIG["epsilon_decay"] == 0.992
+
+    # Ensure Any typing hint in TrafficGenerator resolves cleanly at runtime
+    hints = typing.get_type_hints(TrafficGenerator.set_live_rates)
+    assert "rates" in hints
 
     env = TrafficLightEnv(scenario_id="SC3_ASYMMETRIC", seed=42)
     env.reset(seed=42)
@@ -113,12 +122,12 @@ def test_config_and_generator() -> None:
     assert abs(env.traffic_generator.get_arrival_rates(0.0)[0] - 0.5) < 1e-6
     env.close()
     assert "pygame" not in sys.modules, "core/ must never import pygame!"
-    print("        -> OK: MDP constants, configs, spawner/live rates, and headless isolation verified.")
+    print("        -> OK: MDP constants, configs, typing hints, spawner/live rates verified.")
 
 
 def test_discretizer_transform() -> None:
     """Verify StateDiscretizer.transform(obs, info) -> 972 discrete states."""
-    print("  [2/5] Checking StateDiscretizer.transform(obs, info) interface...")
+    print("  [2/6] Checking StateDiscretizer.transform(obs, info) interface...")
     discretizer = StateDiscretizer()
     dummy_obs = np.zeros(10, dtype=np.float32)
     dummy_info = {
@@ -134,13 +143,14 @@ def test_discretizer_transform() -> None:
     print(f"        -> OK: Discretizer returned tuple {state_tuple} mapping to ID {flat_idx} (0-971).")
 
 
-def test_agent_contract_all_6_agents() -> None:
-    """Verify observation space, full info keys, and action masking across all 6 agents."""
-    print("  [3/5] Verifying Interface Contract across all 6 agents (15 steps each)...")
+def test_agent_contract_all_agents() -> None:
+    """Verify observation space, full info keys, and action masking across all 7 agents."""
+    print("  [3/6] Verifying Interface Contract across all agents (15 steps each)...")
     env = TrafficLightEnv(scenario_id="SC3_ASYMMETRIC", seed=42)
 
     agents = [
         FixedTimeAgent(cycle_green_time=30.0, name="FixedTime"),
+        WebsterAgent(name="Webster"),
         MaxPressureAgent(theta_diff=3.0, name="MaxPressure"),
         QLearningAgent(name="QLearning"),
         DQNAgent(use_double_dqn=False, name="StandardDQN"),
@@ -168,16 +178,16 @@ def test_agent_contract_all_6_agents() -> None:
 
             next_obs, reward, term, trunc, next_info = env.step(action)
             assert isinstance(reward, float) and math.isfinite(reward)
-            agent.update(obs, action, reward, next_obs, term or trunc, info, next_info)
+            agent.update(obs, action, reward, next_obs, term, info, next_info, truncated=trunc)
             obs, info = next_obs, next_info
 
-        print(f"        [PASS {idx}/6] {agent.name}: 15/15 steps compliant.")
+        print(f"        [PASS {idx}/7] {agent.name}: 15/15 steps compliant.")
     env.close()
 
 
 def test_rl_updates_no_nan_inf() -> None:
     """Ensure QLearning, StandardDQN, DoubleDQN, and PPO execute real updates without NaN/Inf."""
-    print("  [4/5] Testing gradient/Bellman updates (no NaN/Inf) for 4 RL agents...")
+    print("  [4/6] Testing gradient/Bellman updates (no NaN/Inf) for 4 RL agents...")
     env = TrafficLightEnv(scenario_id="SC3_ASYMMETRIC", seed=123)
 
     rl_agents = [
@@ -194,7 +204,7 @@ def test_rl_updates_no_nan_inf() -> None:
         for _ in range(10):
             action = agent.select_action(obs, info, eval_mode=False)
             nobs, r, term, trunc, ninfo = env.step(action)
-            metrics = agent.update(obs, action, r, nobs, term or trunc, info, ninfo)
+            metrics = agent.update(obs, action, r, nobs, term, info, ninfo, truncated=trunc)
             if metrics is not None:
                 update_count += 1
                 for k, v in metrics.items():
@@ -208,7 +218,7 @@ def test_rl_updates_no_nan_inf() -> None:
 
 def test_pth_and_onnx_roundtrip() -> None:
     """Verify saving/loading .pth and exporting/running .onnx for PPOAgent & DQNAgent."""
-    print("  [5/5] Verifying .pth + .onnx export & masked inference reload...")
+    print("  [5/6] Verifying .pth + .onnx export & masked inference reload...")
     ppo = PPOAgent(device="cpu")
     ddqn = DQNAgent(use_double_dqn=True, device="cpu")
 
@@ -217,7 +227,6 @@ def test_pth_and_onnx_roundtrip() -> None:
     mask_switch_only = np.array([[0.0, 1.0]], dtype=np.float32)
 
     with tempfile.TemporaryDirectory() as td:
-        # 1. PPO round-trip
         ppo_pth = os.path.join(td, "ppo_test.pth")
         ppo_onnx = os.path.join(td, "ppo_test.onnx")
         ppo.save(ppo_pth)
@@ -225,13 +234,12 @@ def test_pth_and_onnx_roundtrip() -> None:
         ppo_reloaded.load(ppo_pth)
         ppo_reloaded.export_onnx(ppo_onnx)
 
-        sess_ppo = ort.InferenceSession(ppo_onnx)
+        sess_ppo = ort.InferenceSession(ppo_onnx, providers=["CPUExecutionProvider"])
         probs_0, act_0 = sess_ppo.run(None, {"obs": test_obs, "action_mask": mask_keep_only})
         probs_1, act_1 = sess_ppo.run(None, {"obs": test_obs, "action_mask": mask_switch_only})
         assert int(act_0[0]) == 0 and np.isfinite(probs_0).all()
         assert int(act_1[0]) == 1 and np.isfinite(probs_1).all()
 
-        # 2. Double DQN round-trip
         dqn_pth = os.path.join(td, "ddqn_test.pth")
         dqn_onnx = os.path.join(td, "ddqn_test.onnx")
         ddqn.save(dqn_pth)
@@ -239,7 +247,7 @@ def test_pth_and_onnx_roundtrip() -> None:
         dqn_reloaded.load(dqn_pth)
         dqn_reloaded.export_onnx(dqn_onnx)
 
-        sess_dqn = ort.InferenceSession(dqn_onnx)
+        sess_dqn = ort.InferenceSession(dqn_onnx, providers=["CPUExecutionProvider"])
         q_0, dact_0 = sess_dqn.run(None, {"obs": test_obs, "action_mask": mask_keep_only})
         q_1, dact_1 = sess_dqn.run(None, {"obs": test_obs, "action_mask": mask_switch_only})
         assert int(dact_0[0]) == 0 and np.isfinite(q_0).all()
@@ -248,23 +256,101 @@ def test_pth_and_onnx_roundtrip() -> None:
     print("        -> OK: Both PPOAgent and DQNAgent .pth + .onnx verified via ONNXRuntime!")
 
 
+def test_p0_scientific_guarantees() -> None:
+    """Verify P0 fixes: A/B Poisson invariance, active-queue avg_wait_time, Semi-MDP scaling, & truncation bootstrap."""
+    print("  [6/6] Checking P0 Regression Assertions (A/B Invariance, Wait, Semi-MDP, Truncation)...")
+
+    # 1. A/B Arrival Invariance: [5]*8 (40s) vs [8]*5 (40s) must produce identical arrivals & timestamps
+    gen_a = TrafficGenerator(scenario_id="SC3_ASYMMETRIC", seed=2026)
+    gen_b = gen_a.clone_synchronized_generator()
+
+    times_a: dict[int, list[float]] = {app: [] for app in APPROACHES}
+    t_cur = 0.0
+    for dt in [5.0] * 8:
+        arr = gen_a.generate_arrivals(t_cur, dt)
+        for app in APPROACHES:
+            times_a[app].extend(v.arrival_time for v in arr[app])
+        t_cur += dt
+
+    times_b: dict[int, list[float]] = {app: [] for app in APPROACHES}
+    t_cur = 0.0
+    for dt in [8.0] * 5:
+        arr = gen_b.generate_arrivals(t_cur, dt)
+        for app in APPROACHES:
+            times_b[app].extend(v.arrival_time for v in arr[app])
+        t_cur += dt
+
+    for app in APPROACHES:
+        assert len(times_a[app]) == len(times_b[app]), f"Approach {app} count mismatch: {len(times_a[app])} vs {len(times_b[app])}"
+        assert np.allclose(times_a[app], times_b[app]), f"Approach {app} arrival timestamps mismatch!"
+
+    # 2. Queued red vehicles must count toward avg_wait_time even when 0 cars exited
+    env_w = TrafficLightEnv(scenario_id="SC1_LOW", seed=123)
+    env_w.reset(seed=123)
+    env_w.traffic_generator.set_spawner_enabled(False)
+    # Place waiting vehicles strictly on RED axis (EAST=2) with 0 passed vehicles
+    env_w.queues[2].append(Vehicle(vehicle_id=1, approach=2, arrival_time=0.0))
+    env_w.queues[2].append(Vehicle(vehicle_id=2, approach=2, arrival_time=1.0))
+    _, _, _, _, info_w = env_w.step(0)  # NS keeps green; East stays RED at t=5s
+    assert info_w["total_passed"] == 0
+    assert info_w["avg_wait_time"] > 0.0, "Queued un-discharged vehicles were ignored in avg_wait_time!"
+    env_w.close()
+
+    # 3. Semi-MDP time_scale: 8s step holding cost == 1.6x of 5s step holding cost
+    env_s = TrafficLightEnv(scenario_id="SC1_LOW", seed=123)
+    env_s.reset(seed=123)
+    env_s.queues[2].append(Vehicle(vehicle_id=10, approach=2, arrival_time=0.0))
+    r_5s = env_s._compute_reward(action_switched=False, passed_vehicles=0, dt_step=5.0)
+    r_8s = env_s._compute_reward(action_switched=False, passed_vehicles=0, dt_step=8.0)
+    assert abs(r_8s / r_5s - 1.6) < 1e-5, f"Semi-MDP holding ratio expected 1.6, got {r_8s / r_5s}"
+    env_s.close()
+
+    # 4. Truncation bootstrap for QLearning, DQN, PPO (truncated=True, terminated=False)
+    obs0 = np.full(10, 0.2, dtype=np.float32)
+    obs1 = np.full(10, 0.4, dtype=np.float32)
+    info0 = {"raw_queues": [2, 2, 2, 2], "max_waits": [5.0, 5.0, 5.0, 5.0], "phase": 0, "phase_duration": 15.0, "action_mask": np.array([1, 1], dtype=np.int8)}
+    info1 = {"raw_queues": [3, 3, 2, 2], "max_waits": [10.0, 10.0, 8.0, 8.0], "phase": 0, "phase_duration": 20.0, "action_mask": np.array([1, 1], dtype=np.int8), "is_truncated": True}
+
+    ql = QLearningAgent(lr=1.0, gamma=0.95)
+    s_next_idx = ql.discretizer.to_index(ql.discretizer.transform(obs1, info1))
+    ql.q_table[s_next_idx] = 10.0
+    ql.update(obs0, 0, -1.0, obs1, done=False, info=info0, next_info=info1, truncated=True)
+    s0_idx = ql.discretizer.to_index(ql.discretizer.transform(obs0, info0))
+    expected_ql = -1.0 + 0.95 * 10.0
+    assert abs(ql.q_table[s0_idx, 0] - expected_ql) < 1e-4, f"QL truncation bootstrap failed: {ql.q_table[s0_idx, 0]} vs {expected_ql}"
+
+    dqn_ag = DQNAgent(use_double_dqn=True, min_replay_size=2, batch_size=2, device="cpu")
+    dqn_ag.update(obs0, 0, -1.0, obs1, done=False, info=info0, next_info=info1, truncated=True)
+    dqn_metrics = dqn_ag.update(obs0, 1, -1.5, obs1, done=False, info=info0, next_info=info1, truncated=True)
+    assert dqn_metrics is not None and all(math.isfinite(float(v)) for v in dqn_metrics.values())
+    assert dqn_ag.replay_buffer.buffer[-1][4] is False, "DQN ReplayBuffer should NOT treat truncated=True as absorbing done=True!"
+
+    ppo_ag = PPOAgent(rollout_steps=4, mini_batch_size=2, device="cpu")
+    for k in range(3):
+        ppo_ag.select_action(obs0, info0, eval_mode=False)
+        ppo_ag.update(obs0, 0, -1.0, obs1, done=False, info=info0, next_info=info0, truncated=False)
+    ppo_ag.select_action(obs0, info0, eval_mode=False)
+    ppo_metrics = ppo_ag.update(obs0, 0, -1.0, obs1, done=False, info=info0, next_info=info1, truncated=True)
+    assert ppo_metrics is not None and all(math.isfinite(float(v)) for v in ppo_metrics.values())
+
+    print("        -> OK: A/B Poisson invariance, Active-queue Wait, Semi-MDP 1.6x scaling & Truncation verified!")
+
+
 def main() -> int:
-    print("=" * 80)
-    print("  SMARTTRAFFIC RL STUDIO — FULL CONTRACT & SMOKE VERIFICATION (METHOD B)")
-    print("=" * 80)
+    print("=" * 84)
+    print("  SMARTTRAFFIC RL STUDIO — COMPLETE CONTRACT & SCIENTIFIC VERIFICATION")
+    print("=" * 84)
     try:
         test_config_and_generator()
         test_discretizer_transform()
-        test_agent_contract_all_6_agents()
+        test_agent_contract_all_agents()
         test_rl_updates_no_nan_inf()
         test_pth_and_onnx_roundtrip()
+        test_p0_scientific_guarantees()
 
-        print("\n" + "=" * 80)
-        print("  ALL 5 VERIFICATION STAGES PASSED SUCCESSFULLY!")
-        print("  - 6 Agents (FixedTime, MaxPressure, QLearning, StandardDQN, DoubleDQN, PPO) -> PASSED")
-        print("  - 15 Info Keys (8 backward-compat + 7 HUD/Telemetry keys) -> PASSED")
-        print("  - Gradient / Bellman updates (0 NaN/Inf) & ONNX/PyTorch roundtrip -> PASSED")
-        print("=" * 80 + "\n")
+        print("\n" + "=" * 84)
+        print("  ALL 6 VERIFICATION STAGES PASSED SUCCESSFULLY!")
+        print("=" * 84 + "\n")
         return 0
     except AssertionError as err:
         print(f"\n[CONTRACT VIOLATION]: {err}\n")

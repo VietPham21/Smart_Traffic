@@ -143,30 +143,20 @@ class WebsterAgent(BaseAgent):
         eval_mode: bool = False,
     ) -> int:
         """Select action adhering to computed Webster green split and info['action_mask']."""
-        # TODO [Trương Hữu Quang]: Hoàn thiện thuật toán Webster Optimal Split
         action_mask = info.get("action_mask", np.array([1, 1], dtype=np.int8))
         current_phase = int(info.get("phase", int(round(obs[8]))))
-
-        if current_phase != self._last_phase:
-            self._elapsed_in_phase = 0.0
-            self._last_phase = current_phase
-        else:
-            self._elapsed_in_phase += float(DELTA_T_GREEN)
+        phase_duration = float(info.get("phase_duration", float(obs[9]) * float(T_MAX)))
 
         if action_mask[ACTION_KEEP] == 0:
-            self._elapsed_in_phase = 0.0
             return ACTION_SWITCH
-
-        target_green = self.green_splits.get(current_phase, FIXED_TIME_GREEN)
-        if self._elapsed_in_phase >= target_green and action_mask[ACTION_SWITCH] == 1:
-            self._elapsed_in_phase = 0.0
-            return ACTION_SWITCH
-
-        if action_mask[ACTION_KEEP] == 1:
+        if action_mask[ACTION_SWITCH] == 0:
             return ACTION_KEEP
 
-        valid_actions = np.where(action_mask == 1)[0]
-        return int(valid_actions[0]) if len(valid_actions) > 0 else ACTION_KEEP
+        target_green = self.green_splits.get(current_phase, FIXED_TIME_GREEN)
+        if phase_duration >= target_green and action_mask[ACTION_SWITCH] == 1:
+            return ACTION_SWITCH
+
+        return ACTION_KEEP
 
 
 class MaxPressureAgent(BaseAgent):

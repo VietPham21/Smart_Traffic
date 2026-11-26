@@ -330,7 +330,7 @@ class EnvironmentInspectorApp:
         self.screen.blit(self.fonts["header"].render(rw_str, True, COLOR_GREEN if self.last_reward > -1.0 else COLOR_YELLOW), (x + 35, cur_y + 34))
 
         formula_text = [
-            "Công thức: r_t = - [ 1.0 * sum(q_i) + 1.5 * sum((w_i)^2) + 0.25 * 1(switch) ]",
+            "Công thức: r_t = - [ (dt/5)*(1.0*sum(q_i) + 1.5*sum(w_i^2)) + 0.25*1(sw) ]",
             "                 + 0.4 * (v_passed / 10.0)",
         ]
         for idx, line in enumerate(formula_text):
@@ -344,12 +344,15 @@ class EnvironmentInspectorApp:
         pygame.draw.rect(self.screen, COLOR_CARD_BORDER, (x + 15, cur_y, w - 30, ctrl_h), 1, border_radius=8)
         self.screen.blit(self.fonts["title"].render("4. ĐIỀU KHIỂN & KỊCH BẢN (THỰC HÀNH 3)", True, COLOR_TEXT_PRIMARY), (x + 25, cur_y + 10))
 
-        sc_info = f"Kịch bản: {self.scenario_id}  |  Thời gian mô phỏng: {self.env.current_time:.0f}s  |  Bước: {self.env.step_count}"
+        sim_t = float(self.info.get("sim_time", self.env.sim_time))
+        sc_info = f"Kịch bản: {self.scenario_id}  |  Thời gian mô phỏng: {sim_t:.0f}s  |  Bước: {self.env.step_count}"
         self.screen.blit(self.fonts["bold"].render(sc_info, True, COLOR_ACCENT), (x + 30, cur_y + 34))
 
+        total_passed = int(self.info.get("total_passed", 0))
+        avg_wait = float(self.info.get("avg_wait_time", 0.0))
         stats_txt = (
-            f"Tổng xe xả: {self.env.total_passed_vehicles} xe  |  "
-            f"Thời gian chờ trung bình: {self.env.total_wait_time_accumulated / max(1, self.env.total_passed_vehicles):.1f}s"
+            f"Tổng xe xả: {total_passed} xe  |  "
+            f"Thời gian chờ trung bình: {avg_wait:.1f}s"
         )
         self.screen.blit(self.fonts["normal"].render(stats_txt, True, COLOR_TEXT_PRIMARY), (x + 30, cur_y + 56))
 

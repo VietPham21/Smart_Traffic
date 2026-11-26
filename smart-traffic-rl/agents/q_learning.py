@@ -134,7 +134,6 @@ class StateDiscretizer:
         Returns:
             tuple[int, ...]: (b_B, b_N, b_E, b_W, starve_flag, phase, tau_level)
         """
-        # TODO [Dương Văn Hưng]: Tinh chỉnh logic lượng tử hóa cho StateDiscretizer
         raw_queues = info.get("raw_queues", None)
         if raw_queues is not None:
             b_b = self.discretize_queue(raw_queues[0])
@@ -206,8 +205,7 @@ class QLearningAgent(BaseAgent):
         info: dict[str, Any],
         eval_mode: bool = False,
     ) -> int:
-        """Select a legal control action using epsilon-greedy policy with Action Masking."""
-        # TODO [Dương Văn Hưng]: Hoàn thiện thuật toán Tabular Q-Learning với Action Masking
+        """Select a legal control action using epsilon-greedy policy with Action Masking & random tie-breaking."""
         action_mask = info.get("action_mask", np.array([1, 1], dtype=np.int8))
         valid_actions = np.where(action_mask == 1)[0]
         if len(valid_actions) == 0:
@@ -223,12 +221,11 @@ class QLearningAgent(BaseAgent):
         if np.random.rand() < current_eps:
             return int(np.random.choice(valid_actions))
 
-        # Exploitation among valid actions
-        q_vals = self.q_table[s_idx]
-        masked_q = np.full_like(q_vals, -np.inf)
-        masked_q[valid_actions] = q_vals[valid_actions]
-
-        return int(np.argmax(masked_q))
+        # Exploitation among valid actions with random tie-breaking to eliminate zero-table KEEP bias
+        valid_q = self.q_table[s_idx, valid_actions]
+        max_q = float(np.max(valid_q))
+        best_candidates = valid_actions[np.isclose(valid_q, max_q, atol=1e-9, rtol=0.0)]
+        return int(np.random.choice(best_candidates))
 
     def update(
         self,
@@ -239,9 +236,9 @@ class QLearningAgent(BaseAgent):
         done: bool,
         info: dict[str, Any],
         next_info: dict[str, Any],
+        truncated: bool = False,
     ) -> dict[str, Any] | None:
-        """Perform Bellman tabular update using masked future return."""
-        # TODO [Dương Văn Hưng]: Cập nhật phương trình Bellman có Action Masking
+        """Perform Bellman tabular update using masked future return and proper truncation bootstrapping."""
         s_tuple = self.discretizer.transform(obs, info)
         s_idx = self.discretizer.to_index(s_tuple)
 
@@ -251,7 +248,10 @@ class QLearningAgent(BaseAgent):
         next_mask = next_info.get("action_mask", np.array([1, 1], dtype=np.int8))
         valid_next = np.where(next_mask == 1)[0]
 
-        if done or len(valid_next) == 0:
+        is_truncated = bool(truncated or next_info.get("is_truncated", False))
+        is_terminal = bool(done and not is_truncated)
+
+        if is_terminal or len(valid_next) == 0:
             max_future_q = 0.0
         else:
             max_future_q = float(np.max(self.q_table[s_next_idx, valid_next]))
