@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Callable, Final
+from typing import Any, Callable, Final
 
 
 # ==============================================================================
@@ -69,6 +69,7 @@ DELTA_T: Final[float] = float(DELTA_T_GREEN)
 YELLOW_TIME: Final[float] = float(DELTA_T_YELLOW)
 STARVATION_THRESHOLD: Final[float] = 40.0  # Ngưỡng kích hoạt cờ cảnh báo đói đèn (Mục I.5.2: w_i >= 40s)
 STARTUP_DELAY: Final[float] = 1.0         # Độ trễ khởi hành khi mới chuyển sang xanh (giây)
+STARTUP_LOST_TIME: Final[float] = STARTUP_DELAY  # Alias chuẩn đặc tả Phương án B
 
 
 # ==============================================================================
@@ -253,34 +254,72 @@ WEBSTER_LOST_TIME: Final[float] = 4.0
 MAX_PRESSURE_THRESHOLD: Final[float] = 3.0
 
 # Tabular Q-Learning Hyperparameters
-QL_LEARNING_RATE: Final[float] = 0.1
-QL_EPSILON_START: Final[float] = 1.0
-QL_EPSILON_MIN: Final[float] = 0.01
-QL_EPSILON_DECAY: Final[float] = 0.995
+Q_LEARNING_CONFIG: Final[dict[str, Any]] = {
+    "alpha_lr": 0.1,
+    "gamma": 0.95,
+    "epsilon_start": 1.0,
+    "epsilon_min": 0.02,
+    "epsilon_decay": 0.992,
+    "num_episodes": 500,
+}
 
-# Double Deep Q-Network (Double DQN) Hyperparameters
-DQN_HIDDEN_DIMS: Final[tuple[int, int]] = (64, 64)  # Architecture: 10 -> 64 -> 64 -> 2
-DQN_BUFFER_CAPACITY: Final[int] = 50_000
-DQN_BATCH_SIZE: Final[int] = 64
-DQN_LEARNING_RATE: Final[float] = 1e-3
-DQN_TARGET_UPDATE_FREQ: Final[int] = 200
+QL_LEARNING_RATE: Final[float] = float(Q_LEARNING_CONFIG["alpha_lr"])
+QL_EPSILON_START: Final[float] = float(Q_LEARNING_CONFIG["epsilon_start"])
+QL_EPSILON_MIN: Final[float] = float(Q_LEARNING_CONFIG["epsilon_min"])
+QL_EPSILON_DECAY: Final[float] = float(Q_LEARNING_CONFIG["epsilon_decay"])
+
+# Deep Q-Network / Double DQN Hyperparameters
+DQN_CONFIG: Final[dict[str, Any]] = {
+    "hidden_dims": (64, 64),  # Architecture: 10 -> 64 -> 64 -> 2
+    "lr": 5e-4,
+    "gamma": 0.95,
+    "buffer_size": 50_000,
+    "batch_size": 64,
+    "target_update_freq": 200,
+    "epsilon_start": 1.0,
+    "epsilon_min": 0.02,
+    "epsilon_decay": 0.992,
+    "num_episodes": 500,
+}
+
+DQN_HIDDEN_DIMS: Final[tuple[int, int]] = tuple(DQN_CONFIG["hidden_dims"])
+DQN_BUFFER_CAPACITY: Final[int] = int(DQN_CONFIG["buffer_size"])
+DQN_BATCH_SIZE: Final[int] = int(DQN_CONFIG["batch_size"])
+DQN_LEARNING_RATE: Final[float] = float(DQN_CONFIG["lr"])
+DQN_TARGET_UPDATE_FREQ: Final[int] = int(DQN_CONFIG["target_update_freq"])
 DQN_MIN_REPLAY_SIZE: Final[int] = 1_000
-DQN_EPSILON_START: Final[float] = 1.0
-DQN_EPSILON_MIN: Final[float] = 0.02
-DQN_EPSILON_DECAY: Final[float] = 0.995
+DQN_EPSILON_START: Final[float] = float(DQN_CONFIG["epsilon_start"])
+DQN_EPSILON_MIN: Final[float] = float(DQN_CONFIG["epsilon_min"])
+DQN_EPSILON_DECAY: Final[float] = float(DQN_CONFIG["epsilon_decay"])
+
+# Proximal Policy Optimization (PPO) Hyperparameters (Actor-Critic Masked Policy + GAE)
+PPO_CONFIG: Final[dict[str, Any]] = {
+    "hidden_dims": (128, 128),  # Actor & Critic: 10 -> 128 -> 128 -> output
+    "lr": 3e-4,
+    "gamma": 0.95,
+    "gae_lambda": 0.95,
+    "clip_eps": 0.2,
+    "entropy_coef": 0.01,
+    "value_coef": 0.5,
+    "max_grad_norm": 0.5,
+    "ppo_epochs": 4,
+    "mini_batch_size": 64,
+    "rollout_steps": 2048,
+    "num_episodes": 500,
+}
 
 
 # ==============================================================================
-# 8. UI & VISUALIZATION (PYGAME 1280x720)
+# 8. UI & VISUALIZATION (PYGAME 1360x760)
 # ==============================================================================
 
-WINDOW_WIDTH: Final[int] = 1280
-WINDOW_HEIGHT: Final[int] = 720
+WINDOW_WIDTH: Final[int] = 1360
+WINDOW_HEIGHT: Final[int] = 760
 FPS: Final[int] = 60
 
-LEFT_PANE_WIDTH: Final[int] = 500   # Khung Trái (Mục I.5.3: 500x720px)
-MID_PANE_WIDTH: Final[int] = 500    # Khung Giữa (Mục I.5.3: 500x720px)
-RIGHT_PANE_WIDTH: Final[int] = 280  # Bảng Điều khiển Phải (Mục I.5.3: 280x720px)
+LEFT_PANE_WIDTH: Final[int] = 510   # Khung Trái (Split-Screen A/B: 510x760px)
+MID_PANE_WIDTH: Final[int] = 510    # Khung Giữa (Split-Screen A/B: 510x760px)
+RIGHT_PANE_WIDTH: Final[int] = 340  # Bảng Điều khiển & HUD Phải (340x760px)
 
 COLOR_BG: Final[tuple[int, int, int]] = (18, 22, 34)
 COLOR_PANE_BORDER: Final[tuple[int, int, int]] = (45, 55, 75)

@@ -8,6 +8,7 @@ Maintainer: Dương Văn Hưng (MSV: 2351170597)
 from __future__ import annotations
 
 import os
+import pickle
 from typing import Any
 import numpy as np
 
@@ -171,6 +172,7 @@ class QLearningAgent(BaseAgent):
         epsilon_start: float = QL_EPSILON_START,
         epsilon_min: float = QL_EPSILON_MIN,
         epsilon_decay: float = QL_EPSILON_DECAY,
+        decay_on_episode_end: bool = True,
         name: str = "Tabular-QLearning",
     ) -> None:
         """Initialize Q-Learning agent.
@@ -179,8 +181,9 @@ class QLearningAgent(BaseAgent):
             lr: Learning rate alpha (default: 0.1).
             gamma: Discount factor gamma (default: 0.95).
             epsilon_start: Initial exploration rate (default: 1.0).
-            epsilon_min: Floor exploration rate (default: 0.01).
-            epsilon_decay: Multiplicative decay per step (default: 0.995).
+            epsilon_min: Floor exploration rate (default: 0.02).
+            epsilon_decay: Multiplicative decay rate (default: 0.992).
+            decay_on_episode_end: If True, decays epsilon at episode end via on_episode_end().
             name: Agent identifier.
         """
         super().__init__(name=name)
@@ -189,6 +192,7 @@ class QLearningAgent(BaseAgent):
         self.epsilon: float = epsilon_start
         self.epsilon_min: float = epsilon_min
         self.epsilon_decay: float = epsilon_decay
+        self.decay_on_episode_end: bool = decay_on_episode_end
 
         self.discretizer: StateDiscretizer = StateDiscretizer()
         self.q_table: np.ndarray = np.zeros(
@@ -258,22 +262,51 @@ class QLearningAgent(BaseAgent):
         # Update rule: Q(s, a) <- Q(s, a) + alpha * TD_Error
         self.q_table[s_idx, action] += self.lr * td_error
 
-        # Decay epsilon
-        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+        if not self.decay_on_episode_end:
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
+        td_loss = float(td_error ** 2)
+        q_val = float(self.q_table[s_idx, action])
         return {
-            "loss": float(td_error ** 2),
+            "loss": td_loss,
+            "td_loss": td_loss,
             "td_error": float(td_error),
-            "q_val": float(self.q_table[s_idx, action]),
+            "q_val": q_val,
+            "mean_q": q_val,
             "epsilon": float(self.epsilon),
         }
 
+    def on_episode_end(self) -> None:
+        """Decay exploration rate epsilon at the end of an episode."""
+        if self.decay_on_episode_end:
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
     def save(self, filepath: str) -> None:
-        """Save Q-table to .npy file."""
+        """Save Q-table to pickle (.pkl / .pth) or numpy (.npy) file."""
         os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
-        np.save(filepath, self.q_table)
+        if filepath.lower().endswith(".npy"):
+            with open(filepath, "wb") as f:
+                np.save(f, self.q_table)
+        else:
+            with open(filepath, "wb") as f:
+                pickle.dump({"q_table": self.q_table, "epsilon": self.epsilon}, f)
 
     def load(self, filepath: str) -> None:
-        """Load Q-table from .npy file."""
-        if os.path.exists(filepath):
-            self.q_table = np.load(filepath)
+        """Load Q-table from pickle or numpy file."""
+        if not os.path.exists(filepath):
+            return
+        if filepath.lower().endswith(".npy"):
+            with open(filepath, "rb") as f:
+                self.q_table = np.load(f, allow_pickle=False)
+        else:
+            try:
+                with open(filepath, "rb") as f:
+                    payload = pickle.load(f)
+                if isinstance(payload, dict) and "q_table" in payload:
+                    self.q_table = np.asarray(payload["q_table"], dtype=np.float32)
+                    self.epsilon = float(payload.get("epsilon", self.epsilon))
+                else:
+                    self.q_table = np.asarray(payload, dtype=np.float32)
+            except Exception:
+                with open(filepath, "rb") as f:
+                    self.q_table = np.load(f, allow_pickle=False)

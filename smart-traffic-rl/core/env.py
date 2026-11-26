@@ -13,6 +13,7 @@ Tác giả / Người phụ trách: Phạm Văn Việt (MSV: 2351170633)
 
 from __future__ import annotations
 
+from collections import deque
 from typing import Any
 import numpy as np
 import gymnasium as gym
@@ -139,6 +140,24 @@ class TrafficLightEnv(gym.Env):
         # Các biến đo lường tích lũy (Telemetry & Metrics)
         self.total_passed_vehicles: int = 0         # Tổng số xe đã thoát thành công qua nút giao
         self.total_wait_time_accumulated: float = 0.0 # Tổng thời gian chờ tích lũy của tất cả các xe đã thoát (giây)
+        self.max_wait_recorded: float = 0.0         # Thời gian chờ lớn nhất từng ghi nhận trong tập (giây)
+
+        # Bộ đếm trượt 60 giây gần nhất (deque các cặp (sim_time_at_departure, num_departed))
+        self._passed_window: deque[tuple[float, int]] = deque()
+        self.last_step_switched: bool = False
+        self.light_states: dict[str, str] = self._compute_light_states(self.phase)
+
+    @property
+    def sim_time(self) -> float:
+        """Thời gian mô phỏng hiện tại (alias chuẩn hóa cho current_time)."""
+        return float(self.current_time)
+
+    @staticmethod
+    def _compute_light_states(phase: int) -> dict[str, str]:
+        """Sinh bản đồ trạng thái màu đèn tường minh của 4 cột đèn."""
+        if phase == PHASE_NS:
+            return {"N": "GREEN", "S": "GREEN", "E": "RED", "W": "RED"}
+        return {"N": "RED", "S": "RED", "E": "GREEN", "W": "GREEN"}
 
     def reset(
         self,
@@ -181,6 +200,10 @@ class TrafficLightEnv(gym.Env):
         self.queues = {app: [] for app in APPROACHES}
         self.total_passed_vehicles = 0
         self.total_wait_time_accumulated = 0.0
+        self.max_wait_recorded = 0.0
+        self._passed_window.clear()
+        self.last_step_switched = False
+        self.light_states = self._compute_light_states(self.phase)
 
         # Tạo vector quan sát s_0 và từ điển info ban đầu
         observation = self._compute_observation()
@@ -333,8 +356,18 @@ class TrafficLightEnv(gym.Env):
         avg_wait = float(
             self.total_wait_time_accumulated / max(1, self.total_passed_vehicles)
         )
+        current_max_wait = max([self.max_wait_recorded, *max_waits])
+        passed_last_60s = int(sum(cnt for _, cnt in self._passed_window))
+        rates = self.traffic_generator.get_arrival_rates(self.current_time)
+        current_rates = {
+            "N": float(rates.get(NORTH, 0.0)),
+            "S": float(rates.get(SOUTH, 0.0)),
+            "E": float(rates.get(EAST, 0.0)),
+            "W": float(rates.get(WEST, 0.0)),
+        }
 
         return {
+            # 8 khóa bắt buộc tương thích ngược 100%
             "raw_queues": raw_queues,
             "max_waits": max_waits,
             "phase": int(self.phase),
@@ -343,6 +376,14 @@ class TrafficLightEnv(gym.Env):
             "step_passed_vehicles": int(passed_vehicles),
             "total_passed": int(self.total_passed_vehicles),
             "avg_wait_time": float(avg_wait),
+            # 7 khóa bổ sung phục vụ Pygame HUD, TensorBoard & Experiment Tracking
+            "max_wait_recorded": float(current_max_wait),
+            "sim_time": float(self.sim_time),
+            "passed_last_60s": passed_last_60s,
+            "last_step_switched": bool(self.last_step_switched),
+            "light_states": dict(self.light_states),
+            "current_rates": current_rates,
+            "spawner_enabled": bool(self.traffic_generator.spawner_enabled),
         }
 
     def step(
@@ -376,6 +417,7 @@ class TrafficLightEnv(gym.Env):
         # ======================================================================
         # BƯỚC 1: KIỂM SOÁT AN TOÀN BẰNG ACTION MASK
         # ======================================================================
+        action = int(action)
         mask = self.get_action_mask()
         applied_action = action
 
@@ -384,6 +426,7 @@ class TrafficLightEnv(gym.Env):
             applied_action = int(np.argmax(mask))
 
         switched = (applied_action == ACTION_SWITCH)
+        self.last_step_switched = switched
         step_passed = 0
 
         # ======================================================================
@@ -428,6 +471,8 @@ class TrafficLightEnv(gym.Env):
 
                 # Thời điểm xe vượt vạch dừng là cuối bước thời gian hiện tại
                 wait_t = discharged_veh.get_wait_time(self.current_time + dt_step)
+                if wait_t > self.max_wait_recorded:
+                    self.max_wait_recorded = float(wait_t)
                 self.total_wait_time_accumulated += wait_t
                 step_passed += 1
                 self.total_passed_vehicles += 1
@@ -437,6 +482,20 @@ class TrafficLightEnv(gym.Env):
         # ======================================================================
         self.current_time += dt_step
         self.step_count += 1
+        self.light_states = self._compute_light_states(self.phase)
+
+        # Cập nhật max_wait_recorded từ hàng đợi đang chờ
+        for app in APPROACHES:
+            if self.queues[app]:
+                lead_w = self.queues[app][0].get_wait_time(self.current_time)
+                if lead_w > self.max_wait_recorded:
+                    self.max_wait_recorded = float(lead_w)
+
+        # Cập nhật cửa sổ trượt 60 giây gần nhất
+        if step_passed > 0:
+            self._passed_window.append((float(self.current_time), int(step_passed)))
+        while self._passed_window and (self.sim_time - self._passed_window[0][0] > 60.0):
+            self._passed_window.popleft()
 
         # Tính toán reward tức thời dựa trên trạng thái hàng đợi và số xe đã xả
         reward = self._compute_reward(action_switched=switched, passed_vehicles=step_passed)

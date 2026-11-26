@@ -1,14 +1,16 @@
-"""Split-Screen Studio Application (Pygame 1280x720).
+"""SmartTraffic RL Studio (Pygame 1360x760, 60 FPS Inference & Live Control UI).
 
-Visualizes side-by-side A/B comparison between Baseline and RL signal controllers
-receiving identical synchronized vehicle arrival streams in real time.
+Supports two interactive visualization modes:
+1. Split-Screen A/B Testing (Default): Left (Baseline: Max-Pressure / Fixed-Time) vs
+   Mid (AI: PPO / Double DQN / Q-Learning) receiving identical Poisson arrivals.
+2. Single Interactive View: Expanded 1020x760 center junction with direct hot-toggle
+   checkbox `[x] Dùng AI` between AI and Fixed/Baseline control.
 
-Panels:
-- Left Pane (500x720): Baseline Intersection (Fixed-Time / Webster / Max-Pressure)
-- Mid Pane (500x720): RL Agent Intersection (Double DQN / DQN / Tabular Q-Learning)
-- Right Pane (280x720): Telemetry Dashboard & Interactive Controls (SC1-SC4, Speed Multiplier)
-
-Maintainer: Cao Đức Đạo (MSV: 2351170581)
+Features full interactive HUD (340x760):
+- Checkbox `[x] Dùng AI` + AI algorithm selector (PPO / DDQN / QL) + Baseline selector (MP / FT)
+- SpawnerCar: ON/OFF, ResetCar, Ẩn/Hiện thông tin, Scenario SC1-SC4, Speed 1x/2x/5x
+- 4 Live Traffic Injection sliders (lambda_B, lambda_N, lambda_D, lambda_T in [0.00, 0.60])
+- Sliding 1-minute metrics card (=== 1 phút gần nhất ===) & Delta % improvements
 """
 
 from __future__ import annotations
@@ -16,12 +18,10 @@ from __future__ import annotations
 import os
 import sys
 
-# Ensure project root is in sys.path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# Enable Windows Per-Monitor V2 High-DPI Awareness (fixes blurry graphics on Windows 10/11)
 if sys.platform == "win32":
     import ctypes
     try:
@@ -51,33 +51,33 @@ from core.config import (
     EAST,
     WEST,
     PHASE_NS,
-    PHASE_EW,
-    ACTION_KEEP,
-    ACTION_SWITCH,
+    SCENARIOS,
     COLOR_BG,
     COLOR_PANE_BORDER,
-    COLOR_ROAD,
-    COLOR_ROAD_MARKING,
     COLOR_GREEN_LIGHT,
-    COLOR_YELLOW_LIGHT,
     COLOR_RED_LIGHT,
-    COLOR_CAR_BODY,
     COLOR_TEXT_PRIMARY,
     COLOR_TEXT_MUTED,
     COLOR_ACCENT_RL,
     COLOR_ACCENT_BASELINE,
-    SCENARIOS,
 )
 from core.env import TrafficLightEnv
 from core.traffic_generator import TrafficGenerator
 from agents.base_agent import BaseAgent
 from agents.baselines import MaxPressureAgent, FixedTimeAgent
+from agents.q_learning import QLearningAgent
 from agents.dqn_agent import DQNAgent
-from ui.traffic_renderer import TrafficRenderer
+from agents.ppo_agent import PPOAgent
+from ui.visual_entities import VisualTrafficScene
 
 
 class SplitScreenStudio:
-    """Side-by-side Pygame 1280x720 A/B Testing Studio for Traffic Signal Control."""
+    """Interactive 1360x760 60 FPS Inference & Live Benchmarking Studio."""
+
+    AI_KEYS = ("ppo", "ddqn", "q_learning")
+    AI_LABELS = {"ppo": "PPO", "ddqn": "DDQN", "q_learning": "Q-Learn"}
+    BASE_KEYS = ("max_pressure", "fixed_time")
+    BASE_LABELS = {"max_pressure": "MaxPress", "fixed_time": "Fixed30s"}
 
     def __init__(
         self,
@@ -86,29 +86,34 @@ class SplitScreenStudio:
         scenario_id: str = "SC3_ASYMMETRIC",
         seed: int = 42,
         headless: bool = False,
+        view_mode: str = "split",
+        ai_key: str = "ppo",
     ) -> None:
-        """Initialize Split-Screen Studio.
+        self.scenario_id: str = scenario_id if scenario_id in SCENARIOS else "SC3_ASYMMETRIC"
+        self.seed: int = int(seed)
+        self.headless: bool = bool(headless)
+        self.view_mode: str = "single" if view_mode == "single" else "split"
 
-        Args:
-            baseline_agent: Controller for the left intersection (default: MaxPressureAgent).
-            rl_agent: Controller for the middle intersection (default: DQNAgent with Double DQN).
-            scenario_id: Starting traffic scenario ID ('SC1_LOW', 'SC2_HIGH', etc.).
-            seed: Shared seed ensuring both environments receive identical vehicle streams.
-            headless: If True, operates in off-screen mode for headless tests.
-        """
-        # TODO [Cao Đức Đạo]: Khởi tạo ứng dụng đồ họa và tham số màn hình
-        self.scenario_id: str = scenario_id
-        self.seed: int = seed
-        self.headless: bool = headless
         self.is_running: bool = False
         self.is_paused: bool = False
-        self.sim_speed: int = 1  # 1x, 2x, 5x, 10x
+        self.sim_speed: int = 1
+        self.use_ai: bool = True
+        self.show_hud_overlay: bool = True
+        self.spawner_enabled: bool = True
+        self.live_rates_active: bool = False
+        self.dragging_slider_idx: Optional[int] = None
 
-        # Agents
-        self.baseline_agent: BaseAgent = baseline_agent or MaxPressureAgent(name="Max-Pressure")
-        self.rl_agent: BaseAgent = rl_agent or DQNAgent(use_double_dqn=True, name="Double-DQN")
+        self.ai_key: str = ai_key if ai_key in self.AI_KEYS else "ppo"
+        self.base_key: str = "max_pressure"
+        self.ai_checkpoint_status: str = ""
 
-        # Initialize Synchronized Dual Environments
+        # Initialize Baseline & AI Agents (loading trained checkpoints if present)
+        self._custom_baseline = baseline_agent is not None
+        self._custom_rl = rl_agent is not None
+        self.baseline_agent: BaseAgent = baseline_agent or self._build_baseline_agent(self.base_key)
+        self.rl_agent: BaseAgent = rl_agent or self._load_ai_agent(self.ai_key, self.scenario_id)
+
+        # Synchronized Environments (strictly decoupled from Pygame)
         self.env_baseline: TrafficLightEnv
         self.env_rl: TrafficLightEnv
         self.obs_baseline: np.ndarray
@@ -116,111 +121,172 @@ class SplitScreenStudio:
         self.info_baseline: dict[str, Any] = {}
         self.info_rl: dict[str, Any] = {}
 
-        self.setup_environments(self.scenario_id, self.seed)
+        # Live Injection slider values (veh/s in [0.0, 0.60])
+        self.slider_rates: list[float] = [0.42, 0.42, 0.08, 0.08]
+        self.ui_rects: dict[str, Any] = {}
 
-        # Pygame Initialization
+        # Pygame handles
         self.pygame_module: Any = None
         self.screen: Any = None
         self.clock: Any = None
         self.fonts: dict[str, Any] = {}
-        self.renderer_baseline: Any = None
-        self.renderer_rl: Any = None
+        self.scene_baseline: Optional[VisualTrafficScene] = None
+        self.scene_rl: Optional[VisualTrafficScene] = None
+        self.scene_single: Optional[VisualTrafficScene] = None
+
+        self.setup_environments(self.scenario_id, self.seed)
 
         if not self.headless:
             self._init_pygame()
 
+    def _build_baseline_agent(self, key: str) -> BaseAgent:
+        if key == "fixed_time":
+            return FixedTimeAgent(cycle_green_time=30.0, name="Fixed-Time")
+        return MaxPressureAgent(theta_diff=3.0, name="Max-Pressure")
+
+    def _load_ai_agent(self, key: str, scenario_id: str) -> BaseAgent:
+        """Instantiate AI agent and load best available checkpoint from models/ with graceful fallback."""
+        models_dir = os.path.join(PROJECT_ROOT, "models")
+        if key == "ppo":
+            agent: BaseAgent = PPOAgent(device="cpu", name="PPO-Clip")
+        elif key == "ddqn":
+            agent = DQNAgent(use_double_dqn=True, device="cpu", name="Double-DQN")
+        else:
+            agent = QLearningAgent(name="Q-Learning")
+
+        candidates = [
+            os.path.join(models_dir, f"{key}_{scenario_id}_best.pth"),
+            os.path.join(models_dir, f"{key}_MIXED_best.pth"),
+            os.path.join(models_dir, f"{key}_{scenario_id}.pth"),
+            os.path.join(models_dir, f"{key}_SC3_ASYMMETRIC_best.pth"),
+        ]
+        loaded_from = None
+        for path in candidates:
+            if os.path.exists(path):
+                try:
+                    agent.load(path)
+                    loaded_from = os.path.basename(path)
+                    break
+                except Exception:
+                    continue
+
+        if loaded_from:
+            self.ai_checkpoint_status = f"Model: {loaded_from}"
+        else:
+            self.ai_checkpoint_status = "Model: Untrained Fallback"
+        return agent
+
     def _init_pygame(self) -> None:
-        """Initialize Pygame display, window surface, and fonts."""
         try:
             import pygame
             self.pygame_module = pygame
             pygame.init()
-            pygame.display.set_caption("SmartTraffic RL Studio — Split-Screen Benchmark")
+            pygame.display.set_caption("SmartTraffic RL Studio — 60 FPS Inference & A/B Lab (1360x760)")
             self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
             self.clock = pygame.time.Clock()
 
-            # Fonts
             pygame.font.init()
-            self.fonts["title"] = pygame.font.SysFont("segoeui", 18, bold=True)
-            self.fonts["body"] = pygame.font.SysFont("segoeui", 14)
-            self.fonts["metric"] = pygame.font.SysFont("segoeui", 22, bold=True)
-            self.fonts["small"] = pygame.font.SysFont("segoeui", 12)
-            self.fonts["bold"] = pygame.font.SysFont("segoeui", 12, bold=True)
+            self.fonts = {
+                "title": pygame.font.SysFont("segoeui", 16, bold=True),
+                "section": pygame.font.SysFont("segoeui", 13, bold=True),
+                "body": pygame.font.SysFont("segoeui", 13),
+                "small": pygame.font.SysFont("segoeui", 11),
+                "bold": pygame.font.SysFont("segoeui", 12, bold=True),
+                "mono": pygame.font.SysFont("consolas", 12, bold=True),
+            }
 
-            # Continuous Vehicle Physics Renderers
-            self.renderer_baseline = TrafficRenderer(
-                offset_x=0,
-                offset_y=0,
-                panel_w=LEFT_PANE_WIDTH,
-                panel_h=WINDOW_HEIGHT,
-                road_w=126,
-            )
-            self.renderer_baseline.reset(self.env_baseline)
-
-            self.renderer_rl = TrafficRenderer(
-                offset_x=LEFT_PANE_WIDTH,
-                offset_y=0,
-                panel_w=MID_PANE_WIDTH,
-                panel_h=WINDOW_HEIGHT,
-                road_w=126,
-            )
-            self.renderer_rl.reset(self.env_rl)
+            self._init_scenes()
         except Exception as e:
             print(f"[SplitScreenStudio] Falling back to headless mode: {e}")
             self.headless = True
 
-    def setup_environments(self, scenario_id: str, seed: int = 42) -> None:
-        """Create two synchronized environments receiving identical vehicle streams."""
-        # TODO [Cao Đức Đạo]: Thiết lập 2 môi trường nhận cùng luồng xe
-        self.scenario_id = scenario_id
-        self.seed = seed
+    def _init_scenes(self) -> None:
+        if self.headless or not self.pygame_module:
+            return
+        self.scene_baseline = VisualTrafficScene(0, 0, LEFT_PANE_WIDTH, WINDOW_HEIGHT, road_w=120)
+        self.scene_rl = VisualTrafficScene(LEFT_PANE_WIDTH, 0, MID_PANE_WIDTH, WINDOW_HEIGHT, road_w=120)
+        self.scene_single = VisualTrafficScene(0, 0, LEFT_PANE_WIDTH + MID_PANE_WIDTH, WINDOW_HEIGHT, road_w=156)
 
-        gen_base = TrafficGenerator(scenario_id=scenario_id, seed=seed)
+        self.scene_baseline.reset(self.info_baseline)
+        self.scene_rl.reset(self.info_rl)
+        self.scene_single.reset(self.info_rl)
+
+    def setup_environments(self, scenario_id: str, seed: int = 42) -> None:
+        """Reset both Baseline and AI environments with identical synchronized vehicle seeds."""
+        self.scenario_id = scenario_id
+        self.seed = int(seed)
+        self.live_rates_active = False
+
+        if not self._custom_rl:
+            self.rl_agent = self._load_ai_agent(self.ai_key, self.scenario_id)
+
+        gen_base = TrafficGenerator(scenario_id=scenario_id, seed=self.seed)
+        gen_base.set_spawner_enabled(self.spawner_enabled)
         gen_rl = gen_base.clone_synchronized_generator()
 
-        self.env_baseline = TrafficLightEnv(scenario_id=scenario_id, seed=seed, traffic_generator=gen_base)
-        self.env_rl = TrafficLightEnv(scenario_id=scenario_id, seed=seed, traffic_generator=gen_rl)
+        self.env_baseline = TrafficLightEnv(scenario_id=scenario_id, seed=self.seed, traffic_generator=gen_base)
+        self.env_rl = TrafficLightEnv(scenario_id=scenario_id, seed=self.seed, traffic_generator=gen_rl)
 
-        self.obs_baseline, self.info_baseline = self.env_baseline.reset(seed=seed)
-        self.obs_rl, self.info_rl = self.env_rl.reset(seed=seed)
+        self.obs_baseline, self.info_baseline = self.env_baseline.reset(seed=self.seed)
+        self.obs_rl, self.info_rl = self.env_rl.reset(seed=self.seed)
 
         self.baseline_agent.reset()
         self.rl_agent.reset()
 
-        if hasattr(self, "renderer_baseline") and self.renderer_baseline:
-            self.renderer_baseline.reset(self.env_baseline)
-        if hasattr(self, "renderer_rl") and self.renderer_rl:
-            self.renderer_rl.reset(self.env_rl)
+        rates = self.info_rl.get("current_rates", {"N": 0.1, "S": 0.1, "E": 0.1, "W": 0.1})
+        self.slider_rates = [rates["N"], rates["S"], rates["E"], rates["W"]]
+
+        if self.scene_baseline:
+            self.scene_baseline.reset(self.info_baseline)
+        if self.scene_rl:
+            self.scene_rl.reset(self.info_rl)
+        if self.scene_single:
+            self.scene_single.reset(self.info_rl)
+
+    def toggle_spawner(self) -> None:
+        self.spawner_enabled = not self.spawner_enabled
+        self.env_baseline.traffic_generator.set_spawner_enabled(self.spawner_enabled)
+        self.env_rl.traffic_generator.set_spawner_enabled(self.spawner_enabled)
+
+    def apply_live_slider_rates(self) -> None:
+        self.live_rates_active = True
+        rate_dict = {
+            NORTH: float(self.slider_rates[0]),
+            SOUTH: float(self.slider_rates[1]),
+            EAST: float(self.slider_rates[2]),
+            WEST: float(self.slider_rates[3]),
+        }
+        self.env_baseline.traffic_generator.set_live_rates(rate_dict)
+        self.env_rl.traffic_generator.set_live_rates(rate_dict)
 
     def step(self) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Advance both baseline and RL environments synchronously by one decision step.
+        """Advance both environments by 1 MDP decision step (Inference Only: eval_mode=True)."""
+        action_base = self.baseline_agent.select_action(self.obs_baseline, self.info_baseline, eval_mode=True)
+        self.obs_baseline, _, term_b, trunc_b, self.info_baseline = self.env_baseline.step(action_base)
 
-        Uses select_action(obs, info, eval_mode=True) adhering to Interface Contract.
-        """
-        # 1. Baseline Decision
-        action_base = self.baseline_agent.select_action(
-            self.obs_baseline,
-            self.info_baseline,
-            eval_mode=True,
-        )
-        self.obs_baseline, r_base, term_b, trunc_b, self.info_baseline = self.env_baseline.step(action_base)
-        if self.renderer_baseline:
-            self.renderer_baseline.sync_with_env(self.env_baseline)
+        # In Single View with `[x] Dùng AI` unchecked, AI intersection is steered live by baseline controller
+        active_ctrl = self.rl_agent if self.use_ai else self.baseline_agent
+        action_rl = active_ctrl.select_action(self.obs_rl, self.info_rl, eval_mode=True)
+        self.obs_rl, _, term_r, trunc_r, self.info_rl = self.env_rl.step(action_rl)
 
-        # 2. RL Agent Decision
-        action_rl = self.rl_agent.select_action(
-            self.obs_rl,
-            self.info_rl,
-            eval_mode=True,
-        )
-        self.obs_rl, r_rl, term_r, trunc_r, self.info_rl = self.env_rl.step(action_rl)
-        if self.renderer_rl:
-            self.renderer_rl.sync_with_env(self.env_rl)
+        if not self.live_rates_active:
+            rates = self.info_rl.get("current_rates", {})
+            if rates:
+                self.slider_rates = [rates.get("N", 0.0), rates.get("S", 0.0), rates.get("E", 0.0), rates.get("W", 0.0)]
+
+        if self.scene_baseline:
+            self.scene_baseline.sync_from_info(self.info_baseline)
+        if self.scene_rl:
+            self.scene_rl.sync_from_info(self.info_rl)
+        if self.scene_single:
+            self.scene_single.sync_from_info(self.info_rl)
+
+        if term_b or trunc_b or term_r or trunc_r:
+            self.setup_environments(self.scenario_id, self.seed + 1)
 
         return self.info_baseline, self.info_rl
 
     def handle_events(self) -> bool:
-        """Handle Pygame user input and button clicks."""
         if self.headless or not self.pygame_module:
             return True
 
@@ -229,10 +295,20 @@ class SplitScreenStudio:
             if event.type == pygame.QUIT:
                 return False
             elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE or event.key == pygame.K_q:
+                if event.key in (pygame.K_ESCAPE, pygame.K_q):
                     return False
                 elif event.key == pygame.K_SPACE:
                     self.is_paused = not self.is_paused
+                elif event.key == pygame.K_v:
+                    self.view_mode = "single" if self.view_mode == "split" else "split"
+                elif event.key == pygame.K_i:
+                    self.use_ai = not self.use_ai
+                elif event.key == pygame.K_s:
+                    self.toggle_spawner()
+                elif event.key == pygame.K_h:
+                    self.show_hud_overlay = not self.show_hud_overlay
+                elif event.key == pygame.K_r:
+                    self.setup_environments(self.scenario_id, self.seed + 1)
                 elif event.key == pygame.K_1:
                     self.setup_environments("SC1_LOW", self.seed)
                 elif event.key == pygame.K_2:
@@ -242,172 +318,361 @@ class SplitScreenStudio:
                 elif event.key == pygame.K_4:
                     self.setup_environments("SC4_DYNAMIC_SURGE", self.seed)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                mouse_x, mouse_y = event.pos
-                self._handle_click(mouse_x, mouse_y)
+                self._handle_mouse_down(event.pos)
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                self.dragging_slider_idx = None
+            elif event.type == pygame.MOUSEMOTION and self.dragging_slider_idx is not None:
+                self._update_slider_from_x(self.dragging_slider_idx, event.pos[0])
 
         return True
 
-    def _handle_click(self, x: int, y: int) -> None:
-        """Handle button click coordinates in Right Telemetry Panel."""
-        x0 = LEFT_PANE_WIDTH + MID_PANE_WIDTH
-        # Check scenario buttons
-        if x0 + 15 <= x <= x0 + RIGHT_PANE_WIDTH - 15:
-            sc_list = ["SC1_LOW", "SC2_HIGH", "SC3_ASYMMETRIC", "SC4_DYNAMIC_SURGE"]
-            for idx, sc_id in enumerate(sc_list):
-                btn_y = 440 + idx * 38
-                if btn_y <= y <= btn_y + 32:
-                    self.setup_environments(sc_id, self.seed)
+    def _update_slider_from_x(self, idx: int, mouse_x: int) -> None:
+        slider_rect = self.ui_rects.get(f"slider_{idx}")
+        if not slider_rect:
+            return
+        ratio = max(0.0, min(1.0, (mouse_x - slider_rect.x) / max(1, slider_rect.w)))
+        self.slider_rates[idx] = round(ratio * 0.60, 2)
+        self.apply_live_slider_rates()
+
+    def _handle_mouse_down(self, pos: tuple[int, int]) -> None:
+        # 1. Check sliders first for smooth dragging
+        for i in range(4):
+            hit_rect = self.ui_rects.get(f"slider_hit_{i}")
+            if hit_rect and hit_rect.collidepoint(pos):
+                self.dragging_slider_idx = i
+                self._update_slider_from_x(i, pos[0])
+                return
+
+        # 2. Check interactive buttons
+        if "btn_view_mode" in self.ui_rects and self.ui_rects["btn_view_mode"].collidepoint(pos):
+            self.view_mode = "single" if self.view_mode == "split" else "split"
+        elif "chk_use_ai" in self.ui_rects and self.ui_rects["chk_use_ai"].collidepoint(pos):
+            self.use_ai = not self.use_ai
+        elif "btn_spawner" in self.ui_rects and self.ui_rects["btn_spawner"].collidepoint(pos):
+            self.toggle_spawner()
+        elif "btn_reset_car" in self.ui_rects and self.ui_rects["btn_reset_car"].collidepoint(pos):
+            self.setup_environments(self.scenario_id, self.seed + 1)
+        elif "btn_toggle_hud" in self.ui_rects and self.ui_rects["btn_toggle_hud"].collidepoint(pos):
+            self.show_hud_overlay = not self.show_hud_overlay
+        elif "btn_auto_rates" in self.ui_rects and self.ui_rects["btn_auto_rates"].collidepoint(pos):
+            self.live_rates_active = False
+            self.env_baseline.traffic_generator.set_live_rates(None)
+            self.env_rl.traffic_generator.set_live_rates(None)
+        elif "btn_pause" in self.ui_rects and self.ui_rects["btn_pause"].collidepoint(pos):
+            self.is_paused = not self.is_paused
+        else:
+            for k in self.AI_KEYS:
+                r = self.ui_rects.get(f"btn_ai_{k}")
+                if r and r.collidepoint(pos):
+                    self.ai_key = k
+                    self._custom_rl = False
+                    self.rl_agent = self._load_ai_agent(self.ai_key, self.scenario_id)
+                    self.rl_agent.reset()
+                    self.use_ai = True
                     return
 
-            # Speed buttons
-            if 634 <= y <= 671:
-                btn_w = 54
-                for idx, spd in enumerate([1, 2, 5, 10]):
-                    bx = x0 + 15 + idx * (btn_w + 7)
-                    if bx <= x <= bx + btn_w:
-                        self.sim_speed = spd
-                        return
+            for k in self.BASE_KEYS:
+                r = self.ui_rects.get(f"btn_base_{k}")
+                if r and r.collidepoint(pos):
+                    self.base_key = k
+                    self._custom_baseline = False
+                    self.baseline_agent = self._build_baseline_agent(self.base_key)
+                    self.baseline_agent.reset()
+                    return
 
-    def render_intersection(self, surface: Any, offset_x: int, env: TrafficLightEnv, title: str, accent_color: tuple[int, int, int]) -> None:
-        """Render one isometric intersection and its comparison header."""
+            for sc in ("SC1_LOW", "SC2_HIGH", "SC3_ASYMMETRIC", "SC4_DYNAMIC_SURGE"):
+                r = self.ui_rects.get(f"btn_sc_{sc}")
+                if r and r.collidepoint(pos):
+                    self.setup_environments(sc, self.seed)
+                    return
+
+            for spd in (1, 2, 5):
+                r = self.ui_rects.get(f"btn_spd_{spd}")
+                if r and r.collidepoint(pos):
+                    self.sim_speed = spd
+                    return
+
+    def _draw_banner(
+        self,
+        surface: Any,
+        offset_x: int,
+        width: int,
+        title: str,
+        subtitle: str,
+        accent: tuple[int, int, int],
+    ) -> None:
         pygame = self.pygame_module
-        if not pygame:
-            return
+        rect = pygame.Rect(offset_x + 12, 10, width - 24, 42)
+        pygame.draw.rect(surface, (15, 23, 36), rect, border_radius=8)
+        pygame.draw.rect(surface, accent, rect, 1, border_radius=8)
+        pygame.draw.circle(surface, accent, (rect.x + 16, rect.centery), 5)
+        t_surf = self.fonts["title"].render(title, True, COLOR_TEXT_PRIMARY)
+        s_surf = self.fonts["small"].render(subtitle, True, COLOR_TEXT_MUTED)
+        surface.blit(t_surf, (rect.x + 30, rect.y + 5))
+        surface.blit(s_surf, (rect.right - s_surf.get_width() - 12, rect.y + 14))
 
-        renderer = self.renderer_baseline if offset_x == 0 else self.renderer_rl
-        if renderer:
-            renderer.render(surface, env, self.fonts)
-
-        header_rect = pygame.Rect(offset_x + 12, 10, LEFT_PANE_WIDTH - 24, 42)
-        pygame.draw.rect(surface, (22, 34, 49), header_rect, border_radius=10)
-        pygame.draw.rect(surface, accent_color, header_rect, 1, border_radius=10)
-        pygame.draw.circle(surface, accent_color, (offset_x + 28, 31), 5)
-        title_txt = self.fonts["title"].render(title, True, COLOR_TEXT_PRIMARY)
-        surface.blit(title_txt, (offset_x + 42, 20))
-        mode_txt = self.fonts["small"].render("LIVE · A/B TEST", True, COLOR_TEXT_MUTED)
-        surface.blit(mode_txt, (offset_x + LEFT_PANE_WIDTH - 133, 24))
-
-        # Pane Border
-        pygame.draw.line(surface, COLOR_PANE_BORDER,
-                         (offset_x + LEFT_PANE_WIDTH, 0),
-                         (offset_x + LEFT_PANE_WIDTH, WINDOW_HEIGHT), 1)
-
-    def render_telemetry_panel(self, surface: Any) -> None:
-        """Draw compact live metrics and controls in the fixed 280px sidebar."""
+    def _draw_button(
+        self,
+        surface: Any,
+        rect: Any,
+        text: str,
+        active: bool = False,
+        active_color: tuple[int, int, int] = (59, 130, 246),
+        idle_color: tuple[int, int, int] = (28, 38, 54),
+        border_color: tuple[int, int, int] = (55, 72, 95),
+    ) -> None:
         pygame = self.pygame_module
-        if not pygame:
-            return
+        bg = active_color if active else idle_color
+        bc = active_color if active else border_color
+        pygame.draw.rect(surface, bg, rect, border_radius=6)
+        pygame.draw.rect(surface, bc, rect, 1, border_radius=6)
+        txt = self.fonts["small"].render(text, True, COLOR_TEXT_PRIMARY)
+        surface.blit(txt, (rect.centerx - txt.get_width() // 2, rect.centery - txt.get_height() // 2))
 
-        x0 = LEFT_PANE_WIDTH + MID_PANE_WIDTH
-        pygame.draw.rect(surface, (15, 23, 36), (x0, 0, RIGHT_PANE_WIDTH, WINDOW_HEIGHT))
-        pygame.draw.line(surface, (48, 66, 83), (x0, 0), (x0, WINDOW_HEIGHT), 1)
+    def render_hud_panel(self, surface: Any) -> None:
+        """Render interactive Right HUD & 1-Minute Rolling Telemetry Dashboard (340 x 760)."""
+        pygame = self.pygame_module
+        x0 = LEFT_PANE_WIDTH + MID_PANE_WIDTH  # 1020
+        pw = RIGHT_PANE_WIDTH                  # 340
+        pygame.draw.rect(surface, (15, 23, 36), (x0, 0, pw, WINDOW_HEIGHT))
+        pygame.draw.line(surface, (48, 66, 83), (x0, 0), (x0, WINDOW_HEIGHT), 2)
 
-        def label(text: str, x: int, y: int, color: tuple[int, int, int], font: str = "small") -> None:
+        self.ui_rects.clear()
+
+        def lbl(text: str, x: int, y: int, color: tuple[int, int, int], font: str = "small") -> None:
             surface.blit(self.fonts[font].render(text, True, color), (x, y))
 
-        label("LIVE TELEMETRY", x0 + 15, 17, COLOR_TEXT_PRIMARY, "title")
-        pygame.draw.line(surface, (48, 66, 83), (x0 + 15, 45), (x0 + RIGHT_PANE_WIDTH - 15, 45), 1)
-        elapsed = int(self.env_rl.current_time)
-        label(f"SIM TIME   {elapsed // 60:02d}:{elapsed % 60:02d} / 30:00", x0 + 15, 57, COLOR_TEXT_MUTED, "body")
-        scenario = SCENARIOS.get(self.scenario_id)
-        label(scenario.name if scenario else self.scenario_id, x0 + 15, 80, (244, 196, 104))
+        # 1. Top Title & View Mode Toggle
+        lbl("SMARTTRAFFIC HUD", x0 + 12, 13, COLOR_TEXT_PRIMARY, "title")
+        mode_rect = pygame.Rect(x0 + 188, 10, 140, 26)
+        self.ui_rects["btn_view_mode"] = mode_rect
+        self._draw_button(
+            surface,
+            mode_rect,
+            "Chế độ: Split A/B" if self.view_mode == "split" else "Chế độ: Single View",
+            active=True,
+            active_color=(37, 99, 235),
+        )
+        pygame.draw.line(surface, (42, 58, 78), (x0 + 12, 42), (x0 + pw - 12, 42), 1)
 
-        def card(y: int, title: str) -> None:
-            rect = pygame.Rect(x0 + 12, y, RIGHT_PANE_WIDTH - 24, 91)
-            pygame.draw.rect(surface, (25, 37, 52), rect, border_radius=10)
-            pygame.draw.rect(surface, (47, 66, 83), rect, 1, border_radius=10)
-            label(title, rect.x + 11, rect.y + 9, COLOR_TEXT_MUTED)
+        # 2. Interactive Controls Card (y=48..224)
+        ctrl_rect = pygame.Rect(x0 + 10, 48, pw - 20, 174)
+        pygame.draw.rect(surface, (23, 33, 49), ctrl_rect, border_radius=8)
+        pygame.draw.rect(surface, (45, 62, 85), ctrl_rect, 1, border_radius=8)
 
-        wait_base = float(self.info_baseline.get("avg_wait_time", 0.0))
-        wait_rl = float(self.info_rl.get("avg_wait_time", 0.0))
-        delta_wait = wait_rl - wait_base
-        passed_base = int(self.info_baseline.get("total_passed", 0))
-        passed_rl = int(self.info_rl.get("total_passed", 0))
-        delta_passed = passed_rl - passed_base
+        # Row A: Checkbox [x] Dùng AI + Checkpoint status
+        chk_rect = pygame.Rect(x0 + 18, 56, 108, 24)
+        self.ui_rects["chk_use_ai"] = chk_rect
+        box_bg = (34, 197, 94) if self.use_ai else (35, 45, 62)
+        pygame.draw.rect(surface, (30, 42, 60), chk_rect, border_radius=5)
+        pygame.draw.rect(surface, box_bg, (chk_rect.x + 6, chk_rect.y + 5, 14, 14), border_radius=3)
+        if self.use_ai:
+            pygame.draw.line(surface, (15, 23, 36), (chk_rect.x + 9, chk_rect.y + 12), (chk_rect.x + 12, chk_rect.y + 16), 2)
+            pygame.draw.line(surface, (15, 23, 36), (chk_rect.x + 12, chk_rect.y + 16), (chk_rect.x + 17, chk_rect.y + 8), 2)
+        lbl("Dùng AI", chk_rect.x + 26, chk_rect.y + 4, COLOR_TEXT_PRIMARY, "bold")
+        lbl(self.ai_checkpoint_status, x0 + 132, 60, (148, 163, 184), "small")
 
-        card(108, "AVG WAIT  ·  SECONDS")
-        label("BASE", x0 + 23, 139, COLOR_ACCENT_BASELINE)
-        label(f"{wait_base:.1f}s", x0 + 66, 137, COLOR_TEXT_PRIMARY, "body")
-        label("RL", x0 + 23, 164, COLOR_ACCENT_RL)
-        label(f"{wait_rl:.1f}s", x0 + 66, 162, COLOR_TEXT_PRIMARY, "body")
-        label(f"Δ {delta_wait:+.1f}s", x0 + 157, 151,
-              COLOR_GREEN_LIGHT if delta_wait <= 0 else COLOR_RED_LIGHT, "body")
+        # Row B: AI Selector (PPO | DDQN | Q-Learn) + Baseline (MP | FT)
+        bx = x0 + 18
+        for k in self.AI_KEYS:
+            r = pygame.Rect(bx, 86, 56, 22)
+            self.ui_rects[f"btn_ai_{k}"] = r
+            self._draw_button(surface, r, self.AI_LABELS[k], active=(self.ai_key == k), active_color=COLOR_ACCENT_RL)
+            bx += 60
+        for k in self.BASE_KEYS:
+            r = pygame.Rect(bx + 6, 86, 62, 22)
+            self.ui_rects[f"btn_base_{k}"] = r
+            self._draw_button(surface, r, self.BASE_LABELS[k], active=(self.base_key == k), active_color=COLOR_ACCENT_BASELINE)
+            bx += 66
 
-        card(208, "VEHICLES DISCHARGED")
-        label("BASE", x0 + 23, 239, COLOR_ACCENT_BASELINE)
-        label(str(passed_base), x0 + 66, 237, COLOR_TEXT_PRIMARY, "body")
-        label("RL", x0 + 23, 264, COLOR_ACCENT_RL)
-        label(str(passed_rl), x0 + 66, 262, COLOR_TEXT_PRIMARY, "body")
-        label(f"Δ {delta_passed:+d}", x0 + 157, 251,
-              COLOR_GREEN_LIGHT if delta_passed >= 0 else COLOR_RED_LIGHT, "body")
+        # Row C: SpawnerCar: ON/OFF | ResetCar | Ẩn/Hiện TT
+        r_sp = pygame.Rect(x0 + 18, 114, 108, 26)
+        r_rs = pygame.Rect(x0 + 131, 114, 86, 26)
+        r_hd = pygame.Rect(x0 + 222, 114, 100, 26)
+        self.ui_rects["btn_spawner"] = r_sp
+        self.ui_rects["btn_reset_car"] = r_rs
+        self.ui_rects["btn_toggle_hud"] = r_hd
+        self._draw_button(
+            surface,
+            r_sp,
+            f"SpawnerCar: {'ON' if self.spawner_enabled else 'OFF'}",
+            active=self.spawner_enabled,
+            active_color=(22, 163, 74),
+            idle_color=(153, 27, 27),
+        )
+        self._draw_button(surface, r_rs, "ResetCar", active=False)
+        self._draw_button(
+            surface,
+            r_hd,
+            "Ẩn TT" if self.show_hud_overlay else "Hiện TT",
+            active=self.show_hud_overlay,
+            active_color=(14, 116, 144),
+        )
 
-        mask_base = self.info_baseline.get("action_mask", np.array([1, 1]))
-        mask_rl = self.info_rl.get("action_mask", np.array([1, 1]))
-        card(308, "PHASE  ·  MASK [KEEP, SWITCH]")
-        phase_base = "N—S" if self.env_baseline.phase == PHASE_NS else "E—W"
-        phase_rl = "N—S" if self.env_rl.phase == PHASE_NS else "E—W"
-        label(f"BASE  {phase_base} {self.env_baseline.phase_duration:.0f}s  {list(mask_base)}",
-              x0 + 22, 340, COLOR_ACCENT_BASELINE)
-        label(f"RL      {phase_rl} {self.env_rl.phase_duration:.0f}s  {list(mask_rl)}",
-              x0 + 22, 367, COLOR_ACCENT_RL)
+        # Row D: Scenarios SC1 - SC4
+        sc_items = [("SC1_LOW", "SC1 Low"), ("SC2_HIGH", "SC2 High"), ("SC3_ASYMMETRIC", "SC3 Lệch"), ("SC4_DYNAMIC_SURGE", "SC4 Surge")]
+        for idx, (sc_id, sc_lbl) in enumerate(sc_items):
+            r = pygame.Rect(x0 + 18 + idx * 77, 148, 73, 26)
+            self.ui_rects[f"btn_sc_{sc_id}"] = r
+            self._draw_button(surface, r, sc_lbl, active=(self.scenario_id == sc_id), active_color=(56, 189, 248))
 
-        label("SCENARIO  ·  KEYS 1–4", x0 + 15, 415, COLOR_TEXT_MUTED)
-        scenario_ids = ["SC1_LOW", "SC2_HIGH", "SC3_ASYMMETRIC", "SC4_DYNAMIC_SURGE"]
-        for idx, scenario_id in enumerate(scenario_ids):
-            y = 440 + idx * 38
-            active = self.scenario_id == scenario_id
-            rect = pygame.Rect(x0 + 15, y, RIGHT_PANE_WIDTH - 30, 32)
-            pygame.draw.rect(surface, (36, 65, 86) if active else (25, 37, 52), rect, border_radius=8)
-            pygame.draw.rect(surface, COLOR_ACCENT_RL if active else (47, 66, 83), rect, 1, border_radius=8)
-            label(f"{idx + 1}   {SCENARIOS[scenario_id].name}", rect.x + 11, rect.y + 8,
-                  COLOR_TEXT_PRIMARY, "body")
+        # Row E: Speed 1x | 2x | 5x + Pause
+        for idx, spd in enumerate((1, 2, 5)):
+            r = pygame.Rect(x0 + 18 + idx * 58, 182, 54, 28)
+            self.ui_rects[f"btn_spd_{spd}"] = r
+            self._draw_button(surface, r, f"{spd}x", active=(self.sim_speed == spd), active_color=(147, 51, 234))
 
-        label("SPEED  ·  SPACE TO PAUSE", x0 + 15, 605, COLOR_TEXT_MUTED)
-        for idx, speed in enumerate([1, 2, 5, 10]):
-            rect = pygame.Rect(x0 + 15 + idx * 61, 634, 54, 36)
-            active = self.sim_speed == speed
-            pygame.draw.rect(surface, (43, 77, 96) if active else (25, 37, 52), rect, border_radius=8)
-            pygame.draw.rect(surface, COLOR_ACCENT_RL if active else (47, 66, 83), rect, 1, border_radius=8)
-            txt = self.fonts["body"].render(f"{speed}x", True, COLOR_TEXT_PRIMARY)
-            surface.blit(txt, (rect.centerx - txt.get_width() // 2,
-                               rect.centery - txt.get_height() // 2))
+        r_pause = pygame.Rect(x0 + 196, 182, 126, 28)
+        self.ui_rects["btn_pause"] = r_pause
+        self._draw_button(
+            surface,
+            r_pause,
+            "▶ Tiếp tục" if self.is_paused else "⏸ Tạm dừng",
+            active=self.is_paused,
+            active_color=(217, 119, 6),
+        )
 
-        status = "PAUSED" if self.is_paused else "RUNNING"
-        status_color = (246, 190, 92) if self.is_paused else (89, 210, 151)
-        label(f"●  {status}   ·   SEED {self.seed}", x0 + 15, 689, status_color)
+        # 3. Live Traffic Injection Sliders (y=230..374)
+        sl_card = pygame.Rect(x0 + 10, 230, pw - 20, 142)
+        pygame.draw.rect(surface, (23, 33, 49), sl_card, border_radius=8)
+        pygame.draw.rect(surface, (45, 62, 85), sl_card, 1, border_radius=8)
+
+        lbl("LIVE INJECTION (λ xe/s)", x0 + 18, 238, COLOR_TEXT_PRIMARY, "bold")
+        r_auto = pygame.Rect(x0 + 252, 236, 70, 20)
+        self.ui_rects["btn_auto_rates"] = r_auto
+        self._draw_button(surface, r_auto, "Auto SC" if self.live_rates_active else "Theo KB", active=not self.live_rates_active, active_color=(30, 100, 130))
+
+        dir_labels = ["Bắc (λ_B)", "Nam (λ_N)", "Đông (λ_Đ)", "Tây (λ_T)"]
+        for idx, dname in enumerate(dir_labels):
+            sy = 266 + idx * 26
+            lbl(dname, x0 + 18, sy + 2, COLOR_TEXT_MUTED, "small")
+
+            track = pygame.Rect(x0 + 92, sy + 7, 172, 6)
+            hit = pygame.Rect(x0 + 88, sy, 180, 22)
+            self.ui_rects[f"slider_{idx}"] = track
+            self.ui_rects[f"slider_hit_{idx}"] = hit
+
+            pygame.draw.rect(surface, (45, 58, 78), track, border_radius=3)
+            val = float(self.slider_rates[idx])
+            fill_w = int((min(0.60, max(0.0, val)) / 0.60) * track.w)
+            pygame.draw.rect(surface, (56, 189, 248) if self.live_rates_active else (74, 222, 128), (track.x, track.y, fill_w, track.h), border_radius=3)
+            knob_x = track.x + fill_w
+            pygame.draw.circle(surface, COLOR_TEXT_PRIMARY, (knob_x, track.centery), 6)
+
+            lbl(f"{val:.2f}", x0 + 274, sy + 1, COLOR_TEXT_PRIMARY, "mono")
+
+        # 4. Telemetry Card: === 1 phút gần nhất === (y=380..748)
+        tel_card = pygame.Rect(x0 + 10, 380, pw - 20, 368)
+        pygame.draw.rect(surface, (23, 33, 49), tel_card, border_radius=8)
+        pygame.draw.rect(surface, (45, 62, 85), tel_card, 1, border_radius=8)
+
+        sim_t = int(self.info_rl.get("sim_time", self.env_rl.current_time))
+        lbl("=== 1 phút gần nhất ===", x0 + 18, 388, (56, 189, 248), "section")
+        lbl(f"T={sim_t // 60:02d}:{sim_t % 60:02d} / 30:00  |  Seed {self.seed}", x0 + 206, 390, COLOR_TEXT_MUTED, "small")
+
+        # Column headers
+        lbl("CHỈ SỐ", x0 + 18, 414, COLOR_TEXT_MUTED, "small")
+        lbl("BASELINE", x0 + 146, 414, COLOR_ACCENT_BASELINE, "bold")
+        lbl("AI / CTRL", x0 + 236, 414, COLOR_ACCENT_RL, "bold")
+        pygame.draw.line(surface, (42, 58, 78), (x0 + 18, 432), (x0 + pw - 18, 432), 1)
+
+        p60_b = int(self.info_baseline.get("passed_last_60s", 0))
+        p60_ai = int(self.info_rl.get("passed_last_60s", 0))
+        tot_b = int(self.info_baseline.get("total_passed", 0))
+        tot_ai = int(self.info_rl.get("total_passed", 0))
+        wait_b = float(self.info_baseline.get("avg_wait_time", 0.0))
+        wait_ai = float(self.info_rl.get("avg_wait_time", 0.0))
+        maxw_b = float(self.info_baseline.get("max_wait_recorded", 0.0))
+        maxw_ai = float(self.info_rl.get("max_wait_recorded", 0.0))
+        tau_b = float(self.info_baseline.get("phase_duration", 0.0))
+        tau_ai = float(self.info_rl.get("phase_duration", 0.0))
+        ph_b = "B-N" if self.info_baseline.get("phase", 0) == PHASE_NS else "Đ-T"
+        ph_ai = "B-N" if self.info_rl.get("phase", 0) == PHASE_NS else "Đ-T"
+        m_b = list(self.info_baseline.get("action_mask", [1, 1]))
+        m_ai = list(self.info_rl.get("action_mask", [1, 1]))
+
+        rows = [
+            ("Xe qua (1p):", f"{p60_b} xe", f"{p60_ai} xe"),
+            ("Tổng xe qua:", f"{tot_b} xe", f"{tot_ai} xe"),
+            ("Chờ TB (s):", f"{wait_b:.1f}s", f"{wait_ai:.1f}s"),
+            ("Chờ Max (s):", f"{maxw_b:.1f}s", f"{maxw_ai:.1f}s"),
+            ("Đèn xanh:", f"{ph_b} {tau_b:.0f}s", f"{ph_ai} {tau_ai:.0f}s"),
+            ("Action Mask:", f"{m_b}", f"{m_ai}"),
+        ]
+
+        ry = 442
+        for k_txt, v_b, v_ai in rows:
+            lbl(k_txt, x0 + 18, ry, COLOR_TEXT_MUTED, "body")
+            lbl(v_b, x0 + 146, ry, COLOR_TEXT_PRIMARY, "mono")
+            lbl(v_ai, x0 + 236, ry, COLOR_TEXT_PRIMARY, "mono")
+            ry += 28
+
+        # Delta improvement highlight cards (% Giảm chờ & % Tăng thông lượng)
+        pct_wait_reduce = ((wait_b - wait_ai) / max(0.1, wait_b)) * 100.0
+        pct_tp_gain = ((tot_ai - tot_b) / max(1, tot_b)) * 100.0
+
+        d_card1 = pygame.Rect(x0 + 18, 622, pw - 36, 48)
+        w_win = pct_wait_reduce >= 0.0
+        pygame.draw.rect(surface, (18, 52, 38) if w_win else (58, 24, 30), d_card1, border_radius=7)
+        pygame.draw.rect(surface, COLOR_GREEN_LIGHT if w_win else COLOR_RED_LIGHT, d_card1, 1, border_radius=7)
+        lbl("% Giảm Thời gian Chờ (AI vs Base)", d_card1.x + 10, d_card1.y + 6, COLOR_TEXT_MUTED, "small")
+        lbl(f"{pct_wait_reduce:+.1f}% ({wait_ai - wait_b:+.1f}s)", d_card1.x + 10, d_card1.y + 23, COLOR_GREEN_LIGHT if w_win else COLOR_RED_LIGHT, "bold")
+
+        d_card2 = pygame.Rect(x0 + 18, 678, pw - 36, 48)
+        t_win = pct_tp_gain >= 0.0
+        pygame.draw.rect(surface, (18, 52, 38) if t_win else (58, 24, 30), d_card2, border_radius=7)
+        pygame.draw.rect(surface, COLOR_GREEN_LIGHT if t_win else COLOR_RED_LIGHT, d_card2, 1, border_radius=7)
+        lbl("% Tăng Thông lượng (AI vs Base)", d_card2.x + 10, d_card2.y + 6, COLOR_TEXT_MUTED, "small")
+        lbl(f"{pct_tp_gain:+.1f}% ({tot_ai - tot_b:+d} xe)", d_card2.x + 10, d_card2.y + 23, COLOR_GREEN_LIGHT if t_win else COLOR_RED_LIGHT, "bold")
 
     def render(self) -> None:
-        """Render complete studio frame to screen."""
         if self.headless or not self.screen:
             return
 
+        pygame = self.pygame_module
         self.screen.fill(COLOR_BG)
 
-        # 1. Left Intersection: Baseline
-        self.render_intersection(
-            self.screen,
-            offset_x=0,
-            env=self.env_baseline,
-            title=f"BASELINE: {self.baseline_agent.name}",
-            accent_color=COLOR_ACCENT_BASELINE,
-        )
+        if self.view_mode == "split":
+            if self.scene_baseline:
+                self.scene_baseline.draw(self.screen, self.info_baseline, self.fonts, show_overlay=self.show_hud_overlay)
+                self._draw_banner(
+                    self.screen,
+                    offset_x=0,
+                    width=LEFT_PANE_WIDTH,
+                    title=f"BASELINE: {self.baseline_agent.name}",
+                    subtitle="SYNCHRONIZED STREAM",
+                    accent=COLOR_ACCENT_BASELINE,
+                )
+            pygame.draw.line(self.screen, COLOR_PANE_BORDER, (LEFT_PANE_WIDTH, 0), (LEFT_PANE_WIDTH, WINDOW_HEIGHT), 2)
 
-        # 2. Middle Intersection: RL Agent
-        self.render_intersection(
-            self.screen,
-            offset_x=LEFT_PANE_WIDTH,
-            env=self.env_rl,
-            title=f"AI CONTROLLER: {self.rl_agent.name}",
-            accent_color=COLOR_ACCENT_RL,
-        )
+            if self.scene_rl:
+                self.scene_rl.draw(self.screen, self.info_rl, self.fonts, show_overlay=self.show_hud_overlay)
+                ctrl_name = self.rl_agent.name if self.use_ai else f"{self.baseline_agent.name} (AI OFF)"
+                self._draw_banner(
+                    self.screen,
+                    offset_x=LEFT_PANE_WIDTH,
+                    width=MID_PANE_WIDTH,
+                    title=f"AI CONTROLLER: {ctrl_name}",
+                    subtitle="INFERENCE ONLY",
+                    accent=COLOR_ACCENT_RL if self.use_ai else COLOR_ACCENT_BASELINE,
+                )
+        else:
+            if self.scene_single:
+                self.scene_single.draw(self.screen, self.info_rl, self.fonts, show_overlay=self.show_hud_overlay)
+                ctrl_title = f"CHẾ ĐỘ ĐƠN — ĐANG DÙNG AI: {self.rl_agent.name}" if self.use_ai else f"CHẾ ĐỘ ĐƠN — CỐ ĐỊNH: {self.baseline_agent.name}"
+                self._draw_banner(
+                    self.screen,
+                    offset_x=0,
+                    width=LEFT_PANE_WIDTH + MID_PANE_WIDTH,
+                    title=ctrl_title,
+                    subtitle="Nhấn [x] Dùng AI để chuyển nóng",
+                    accent=COLOR_ACCENT_RL if self.use_ai else COLOR_ACCENT_BASELINE,
+                )
 
-        # 3. Right Telemetry & Control Panel
-        self.render_telemetry_panel(self.screen)
-
-        self.pygame_module.display.flip()
+        self.render_hud_panel(self.screen)
+        pygame.display.flip()
 
     def run(self, max_steps: Optional[int] = None) -> None:
-        """Execute split-screen interactive visualization loop with continuous vehicle motion."""
         self.is_running = True
         step_idx = 0
         last_step_ticks = self.pygame_module.time.get_ticks() if self.pygame_module and not self.headless else 0
@@ -419,28 +684,27 @@ class SplitScreenStudio:
 
             now = self.pygame_module.time.get_ticks() if self.pygame_module and not self.headless else 0
 
-            # 1. Update continuous physical animation at 60 FPS
             if self.pygame_module and not self.headless:
                 dt = (now - last_frame_ticks) / 1000.0
                 last_frame_ticks = now
                 if dt > 0.08:
                     dt = 0.016
-                if self.renderer_baseline:
-                    self.renderer_baseline.update(dt)
-                if self.renderer_rl:
-                    self.renderer_rl.update(dt)
+                if self.scene_baseline:
+                    self.scene_baseline.update(dt, speed_mult=float(self.sim_speed))
+                if self.scene_rl:
+                    self.scene_rl.update(dt, speed_mult=float(self.sim_speed))
+                if self.scene_single:
+                    self.scene_single.update(dt, speed_mult=float(self.sim_speed))
 
-            # 2. Advance decision steps
             if not self.is_paused:
                 if self.headless:
-                    for _ in range(self.sim_speed):
-                        self.step()
-                        step_idx += 1
-                        if max_steps and step_idx >= max_steps:
-                            self.is_running = False
-                            break
+                    self.step()
+                    step_idx += 1
+                    if max_steps and step_idx >= max_steps:
+                        self.is_running = False
+                        break
                 else:
-                    step_interval_ms = max(50, 400 // max(1, self.sim_speed))
+                    step_interval_ms = max(60, 700 // max(1, self.sim_speed))
                     if now - last_step_ticks >= step_interval_ms:
                         self.step()
                         last_step_ticks = now
@@ -450,14 +714,12 @@ class SplitScreenStudio:
                             break
 
             self.render()
-
             if self.clock:
                 self.clock.tick(FPS)
 
         self.close()
 
     def close(self) -> None:
-        """Clean up Pygame and environment resources."""
         if self.pygame_module and not self.headless:
             try:
                 self.pygame_module.quit()
@@ -470,7 +732,7 @@ class SplitScreenStudio:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="SmartTraffic RL Split-Screen Studio")
+    parser = argparse.ArgumentParser(description="SmartTraffic RL Studio (1360x760 Inference & HUD)")
     parser.add_argument(
         "--scenario",
         type=str,
@@ -478,15 +740,19 @@ if __name__ == "__main__":
         choices=["SC1_LOW", "SC2_HIGH", "SC3_ASYMMETRIC", "SC4_DYNAMIC_SURGE"],
         help="Initial traffic scenario",
     )
-    parser.add_argument("--seed", type=int, default=42, help="Master PRNG seed")
-    parser.add_argument("--headless", action="store_true", help="Run without Pygame display window")
-    parser.add_argument("--steps", type=int, default=None, help="Optional max simulation steps to run")
+    parser.add_argument("--seed", type=int, default=42, help="Synchronized PRNG seed")
+    parser.add_argument("--view", type=str, default="split", choices=["split", "single"], help="Initial view layout")
+    parser.add_argument("--ai", type=str, default="ppo", choices=["ppo", "ddqn", "q_learning"], help="Default AI agent")
+    parser.add_argument("--headless", action="store_true", help="Run off-screen headless loop")
+    parser.add_argument("--steps", type=int, default=None, help="Max decision steps")
     args = parser.parse_args()
 
-    print(f"Launching SmartTraffic RL Studio [Scenario: {args.scenario}, Seed: {args.seed}]...")
+    print(f"Launching SmartTraffic RL Studio [View: {args.view}, AI: {args.ai}, Scenario: {args.scenario}, Seed: {args.seed}]...")
     studio = SplitScreenStudio(
         scenario_id=args.scenario,
         seed=args.seed,
         headless=args.headless,
+        view_mode=args.view,
+        ai_key=args.ai,
     )
     studio.run(max_steps=args.steps)

@@ -1,0 +1,4 @@
+agent,scenario,episode,global_step,cumulative_reward,episode_length,avg_wait_time,max_wait_time,total_throughput
+dqn,MIXED,1,297,-33.18187500000001,297,13.439119170984457,51.0,772
+dqn,MIXED,2,596,-512.5061458333331,299,44.59511031604055,138.0,1677
+dqn,MIXED,3,897,-420.22010416666683,301,31.952003338898162,103.0,2396

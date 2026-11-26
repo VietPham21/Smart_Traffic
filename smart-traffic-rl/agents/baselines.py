@@ -28,6 +28,7 @@ from core.config import (
     WEBSTER_LOST_TIME,
     MAX_PRESSURE_THRESHOLD,
     DELTA_T_GREEN,
+    T_MAX,
 )
 from .base_agent import BaseAgent
 
@@ -42,16 +43,20 @@ class FixedTimeAgent(BaseAgent):
     def __init__(
         self,
         green_duration: float = FIXED_TIME_GREEN,
+        cycle_green_time: float | None = None,
         name: str = "Fixed-Time",
     ) -> None:
         """Initialize Fixed-Time agent.
 
         Args:
             green_duration: Fixed duration of green signal per phase (seconds).
+            cycle_green_time: Alias for green_duration (default 30.0s per spec).
             name: Agent identifier.
         """
         super().__init__(name=name)
-        self.green_duration: float = green_duration
+        duration = float(cycle_green_time if cycle_green_time is not None else green_duration)
+        self.green_duration: float = duration
+        self.cycle_green_time: float = duration
         self._elapsed_in_phase: float = 0.0
         self._last_phase: int = PHASE_NS
 
@@ -66,33 +71,21 @@ class FixedTimeAgent(BaseAgent):
         info: dict[str, Any],
         eval_mode: bool = False,
     ) -> int:
-        """Select action adhering strictly to info['action_mask']."""
-        # TODO [Trương Hữu Quang]: Hoàn thiện thuật toán Fixed-Time Signal Control
+        """Select action adhering strictly to info['action_mask'] and fixed green duration."""
         action_mask = info.get("action_mask", np.array([1, 1], dtype=np.int8))
-        current_phase = int(info.get("phase", int(round(obs[8]))))
+        phase_duration = float(info.get("phase_duration", float(obs[9]) * float(T_MAX)))
 
-        if current_phase != self._last_phase:
-            self._elapsed_in_phase = 0.0
-            self._last_phase = current_phase
-        else:
-            self._elapsed_in_phase += float(DELTA_T_GREEN)
-
-        # Ràng buộc ép buộc đổi pha từ mask
+        # Ràng buộc bắt buộc từ action_mask
         if action_mask[ACTION_KEEP] == 0:
-            self._elapsed_in_phase = 0.0
             return ACTION_SWITCH
-
-        # Hết thời gian xanh chu kỳ và mask cho phép đổi pha
-        if self._elapsed_in_phase >= self.green_duration and action_mask[ACTION_SWITCH] == 1:
-            self._elapsed_in_phase = 0.0
-            return ACTION_SWITCH
-
-        # Mặc định giữ pha nếu được phép
-        if action_mask[ACTION_KEEP] == 1:
+        if action_mask[ACTION_SWITCH] == 0:
             return ACTION_KEEP
 
-        valid_actions = np.where(action_mask == 1)[0]
-        return int(valid_actions[0]) if len(valid_actions) > 0 else ACTION_KEEP
+        # Chu kỳ cố định: giữ pha khi tau < cycle_green_time, đổi pha khi tau >= cycle_green_time
+        if phase_duration >= self.cycle_green_time and action_mask[ACTION_SWITCH] == 1:
+            return ACTION_SWITCH
+
+        return ACTION_KEEP
 
 
 class WebsterAgent(BaseAgent):
@@ -192,16 +185,20 @@ class MaxPressureAgent(BaseAgent):
     def __init__(
         self,
         pressure_threshold: float = MAX_PRESSURE_THRESHOLD,
+        theta_diff: float | None = None,
         name: str = "Max-Pressure",
     ) -> None:
         """Initialize Max-Pressure agent.
 
         Args:
-            pressure_threshold: Threshold theta_pressure for pressure-based phase switching.
+            pressure_threshold: Threshold theta_diff for pressure-based phase switching (default: 3).
+            theta_diff: Alias for pressure_threshold per specification Algorithm 1.
             name: Agent identifier.
         """
         super().__init__(name=name)
-        self.pressure_threshold: float = pressure_threshold
+        thresh = float(theta_diff if theta_diff is not None else pressure_threshold)
+        self.pressure_threshold: float = thresh
+        self.theta_diff: float = thresh
 
     def select_action(
         self,
@@ -210,7 +207,6 @@ class MaxPressureAgent(BaseAgent):
         eval_mode: bool = False,
     ) -> int:
         """Decide control action based on dynamic pressure differential and info['action_mask']."""
-        # TODO [Cao Đức Đạo] / [Trương Hữu Quang]: Hoàn thiện thuật toán Actuated Max-Pressure Control
         action_mask = info.get("action_mask", np.array([1, 1], dtype=np.int8))
 
         # Ràng buộc bắt buộc từ mặt nạ an toàn
@@ -234,9 +230,9 @@ class MaxPressureAgent(BaseAgent):
             p_active = pressure_ew
             p_red = pressure_ns
 
-        # Luật chuyển pha cảm biến áp lực cực đại
+        # Thuật toán 1: (P_green = 0 and P_red > 0) hoặc (P_red - P_green >= theta_diff) với theta_diff = 3
         pressure_delta = p_red - p_active
-        should_switch = (pressure_delta > self.pressure_threshold) or (p_active == 0 and p_red > 0)
+        should_switch = (p_active == 0 and p_red > 0) or (pressure_delta >= self.theta_diff)
 
         if should_switch and action_mask[ACTION_SWITCH] == 1:
             return ACTION_SWITCH

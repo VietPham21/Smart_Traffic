@@ -1,5 +1,14 @@
 """Experiments package for SmartTraffic RL Studio."""
 
-from .benchmark import BenchmarkRunner
+from __future__ import annotations
 
-__all__ = ["BenchmarkRunner"]
+from typing import Any
+
+__all__ = ["BenchmarkRunner", "run_full_benchmark"]
+
+
+def __getattr__(name: str) -> Any:
+    if name in ("BenchmarkRunner", "run_full_benchmark"):
+        from . import benchmark
+        return getattr(benchmark, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

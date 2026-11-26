@@ -16,10 +16,10 @@ CAR_COLORS = [
     (45, 190, 205), (225, 232, 239), (139, 157, 177), (148, 105, 218),
     (236, 115, 55),
 ]
-CAR_SPACING = 34
-V_MAX = 135.0
-A_ACCEL = 170.0
-B_COMFORT = 210.0
+CAR_SPACING = 38
+V_MAX = 210.0
+A_ACCEL = 320.0
+B_COMFORT = 380.0
 
 
 class VisualVehicle:
@@ -51,15 +51,16 @@ class VisualVehicle:
             self.speed = max(desired_speed, self.speed - B_COMFORT * dt)
             self.is_braking = self.speed < 12.0 or desired_speed < self.speed - 15.0
 
-        if self.is_discharged:
-            self.dist += self.speed * dt
-            self.is_braking = False
-        else:
-            self.dist = min(target_dist, self.dist + self.speed * dt)
-            if self.dist >= target_dist - 0.05:
-                self.dist = target_dist
+        next_dist = self.dist + self.speed * dt
+        if next_dist >= target_dist - 0.05:
+            self.dist = max(self.dist, target_dist) if target_dist >= self.dist else target_dist
+            if gap <= 1.0:
                 self.speed = 0.0
                 self.is_braking = True
+        else:
+            self.dist = next_dist
+            if self.is_discharged:
+                self.is_braking = False
 
 
 class TrafficRenderer:
@@ -90,6 +91,7 @@ class TrafficRenderer:
         self.exit_distance = 760.0
         self.spawn_margin = 380.0
         self.vehicles: dict[int, VisualVehicle] = {}
+        self.current_phase: int = PHASE_NS
 
     def project(self, wx: float, wy: float) -> tuple[float, float]:
         """Project world-plane coordinates onto the isometric screen plane."""
@@ -133,6 +135,7 @@ class TrafficRenderer:
 
     def reset(self, env: TrafficLightEnv) -> None:
         self.vehicles.clear()
+        self.current_phase = int(env.phase)
         for approach in APPROACHES:
             queue = env.queues[approach]
             for index, vehicle in enumerate(queue):
@@ -146,18 +149,24 @@ class TrafficRenderer:
                 self.vehicles[vehicle.vehicle_id].queue_index = index
 
     def sync_with_env(self, env: TrafficLightEnv) -> None:
+        self.current_phase = int(env.phase)
         queued: set[int] = set()
         for approach in APPROACHES:
             for index, vehicle in enumerate(env.queues[approach]):
                 queued.add(vehicle.vehicle_id)
                 visual = self.vehicles.get(vehicle.vehicle_id)
                 if visual is None:
+                    min_dist = min(
+                        (v.dist for v in self.vehicles.values() if v.approach == approach),
+                        default=float(CAR_SPACING),
+                    )
                     visual = VisualVehicle(
                         vehicle.vehicle_id, approach,
                         CAR_COLORS[vehicle.vehicle_id % len(CAR_COLORS)],
                         vehicle.vehicle_id % 7 == 0, vehicle.vehicle_id % 5 == 0,
+                        initial_dist=min(0.0, min_dist - float(CAR_SPACING)),
                     )
-                    visual.speed = V_MAX * 0.7
+                    visual.speed = V_MAX * 0.75
                     self.vehicles[vehicle.vehicle_id] = visual
                 visual.queue_index = index
         for vehicle_id, visual in list(self.vehicles.items()):
@@ -168,19 +177,41 @@ class TrafficRenderer:
     def update(self, dt: float) -> None:
         dt = min(max(float(dt), 0.0), 0.08)
         remove: list[int] = []
+
+        # Determine junction box occupancy per approach to prevent cross-axis collisions
+        junction_end = self.stop_distance + float(self.road_w) + 30.0
+        in_box: dict[int, bool] = {app: False for app in APPROACHES}
+        for v in self.vehicles.values():
+            if self.stop_distance - 10.0 < v.dist < junction_end:
+                in_box[v.approach] = True
+
         for approach in APPROACHES:
+            perp_apps = (EAST, WEST) if approach in (NORTH, SOUTH) else (NORTH, SOUTH)
+            perp_busy = any(in_box[p] for p in perp_apps)
+            is_green = (self.current_phase == PHASE_NS) if approach in (NORTH, SOUTH) else (self.current_phase != PHASE_NS)
+            stop_hold = self.stop_distance - 16.0
+
             vehicles = sorted(
                 (v for v in self.vehicles.values() if v.approach == approach),
                 key=lambda v: v.dist, reverse=True,
             )
-            lead_distance = self.exit_distance + 200.0
+            lead_vehicle: VisualVehicle | None = None
             for vehicle in vehicles:
-                target = self.exit_distance if vehicle.is_discharged else max(
-                    0.0, self.stop_distance - 16.0 - vehicle.queue_index * CAR_SPACING
-                )
-                safe_target = min(target, lead_distance - CAR_SPACING)
+                if vehicle.is_discharged:
+                    target = self.exit_distance
+                    if vehicle.dist <= stop_hold + 2.0 and (not is_green or perp_busy):
+                        target = stop_hold
+                else:
+                    target = max(0.0, stop_hold - vehicle.queue_index * CAR_SPACING)
+
+                if lead_vehicle is not None:
+                    req_gap = 40.0 if (vehicle.is_suv or lead_vehicle.is_suv) else float(CAR_SPACING)
+                    safe_target = min(target, lead_vehicle.dist - req_gap)
+                else:
+                    safe_target = target
+
                 vehicle.update_physics(dt, safe_target)
-                lead_distance = vehicle.dist
+                lead_vehicle = vehicle
                 if vehicle.dist >= self.exit_distance:
                     remove.append(vehicle.vehicle_id)
         for vehicle_id in remove:

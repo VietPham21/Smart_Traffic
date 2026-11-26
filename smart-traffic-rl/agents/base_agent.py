@@ -81,6 +81,10 @@ class BaseAgent(ABC):
         """Reset internal agent states at the start of a new episode."""
         pass
 
+    def on_episode_end(self) -> None:
+        """Optional lifecycle hook invoked at the end of an episode (e.g., for epsilon decay)."""
+        pass
+
     def save(self, filepath: str) -> None:
         """Serialize agent weights / Q-table to disk.
 
@@ -96,3 +100,11 @@ class BaseAgent(ABC):
             filepath: Source file path.
         """
         pass
+
+    def export_onnx(self, filepath: str) -> None:
+        """Export Deep RL inference network to ONNX format (optional for Deep RL agents).
+
+        Args:
+            filepath: Target .onnx file path.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not support ONNX export.")

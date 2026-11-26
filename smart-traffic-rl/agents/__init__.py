@@ -11,6 +11,7 @@ from .base_agent import BaseAgent
 from .baselines import FixedTimeAgent, WebsterAgent, MaxPressureAgent
 from .q_learning import StateDiscretizer, QLearningAgent
 from .dqn_agent import QNetwork, ReplayBuffer, DQNAgent
+from .ppo_agent import ActorCriticNetwork, RolloutBuffer, PPOAgent
 
 __all__ = [
     "BaseAgent",
@@ -22,4 +23,7 @@ __all__ = [
     "QNetwork",
     "ReplayBuffer",
     "DQNAgent",
+    "ActorCriticNetwork",
+    "RolloutBuffer",
+    "PPOAgent",
 ]

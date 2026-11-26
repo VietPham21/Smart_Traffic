@@ -1,0 +1,4 @@
+agent,scenario,episode,global_step,cumulative_reward,episode_length,avg_wait_time,max_wait_time,total_throughput
+q_learning,SC3_ASYMMETRIC,1,297,-466.10322916666667,297,40.429093122337186,129.0,1643
+q_learning,SC3_ASYMMETRIC,2,601,-365.82572916666686,304,36.375818939845146,105.0,1679
+q_learning,SC3_ASYMMETRIC,3,901,-389.1477083333332,300,37.81087762669963,111.0,1618

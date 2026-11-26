@@ -10,7 +10,9 @@ Maintainer: Vũ Bá Đài (MSV: 2351170577)
 
 from __future__ import annotations
 
+import copy
 import os
+import warnings
 from collections import deque
 from typing import Any, Optional
 import numpy as np
@@ -123,6 +125,24 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
+class DQNOnnxWrapper(nn.Module):
+    """Inference-ready ONNX wrapper mapping (obs, action_mask) -> (masked_q_values, best_action)."""
+
+    def __init__(self, q_net: QNetwork) -> None:
+        super().__init__()
+        self.q_net = q_net
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        action_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q_values = self.q_net(obs)
+        masked_q_values = q_values + (1.0 - action_mask) * (-1e9)
+        best_action = torch.argmax(masked_q_values, dim=-1)
+        return masked_q_values, best_action
+
+
 class DQNAgent(BaseAgent):
     """Tier 3 Benchmark: Deep Q-Network Agent supporting both Standard DQN and Double DQN."""
 
@@ -138,6 +158,7 @@ class DQNAgent(BaseAgent):
         epsilon_start: float = DQN_EPSILON_START,
         epsilon_min: float = DQN_EPSILON_MIN,
         epsilon_decay: float = DQN_EPSILON_DECAY,
+        decay_on_episode_end: bool = True,
         device: Optional[str] = None,
         name: Optional[str] = None,
     ) -> None:
@@ -153,7 +174,8 @@ class DQNAgent(BaseAgent):
             min_replay_size: Warm-up steps before gradient descent starts.
             epsilon_start: Initial epsilon.
             epsilon_min: Floor epsilon.
-            epsilon_decay: Epsilon multiplicative decay per update.
+            epsilon_decay: Epsilon multiplicative decay rate.
+            decay_on_episode_end: If True, decays epsilon at episode end via on_episode_end().
             device: 'cuda', 'cpu', or None (auto-detect).
             name: Custom agent name.
         """
@@ -168,6 +190,7 @@ class DQNAgent(BaseAgent):
         self.epsilon: float = epsilon_start
         self.epsilon_min: float = epsilon_min
         self.epsilon_decay: float = epsilon_decay
+        self.decay_on_episode_end: bool = decay_on_episode_end
 
         # Select computation device
         if device is None:
@@ -194,9 +217,11 @@ class DQNAgent(BaseAgent):
         eval_mode: bool = False,
     ) -> int:
         """Select action using epsilon-greedy policy with Action Masking."""
-        # TODO [Vũ Bá Đài]: Hoàn thiện thuật toán Double DQN với Action Masking trên PyTorch
-        action_mask = info.get("action_mask", np.array([1, 1], dtype=np.int8))
-        valid_actions = np.where(action_mask == 1)[0]
+        action_mask = np.asarray(
+            info.get("action_mask", np.array([1, 1], dtype=np.int8)),
+            dtype=np.float32,
+        )
+        valid_actions = np.where(action_mask > 0.5)[0]
         if len(valid_actions) == 0:
             return ACTION_KEEP
 
@@ -217,10 +242,8 @@ class DQNAgent(BaseAgent):
         with torch.no_grad():
             q_values = self.online_net(state_tensor).squeeze(0).cpu().numpy()
 
-        # Mask invalid actions with large negative value (-1e9)
-        masked_q = np.full_like(q_values, -1e9)
-        masked_q[valid_actions] = q_values[valid_actions]
-
+        # Áp dụng Action Masking bằng cách cộng (1 - m) * (-1e9)
+        masked_q = q_values + (1.0 - action_mask) * np.float32(-1e9)
         return int(np.argmax(masked_q))
 
     def update(
@@ -255,12 +278,10 @@ class DQNAgent(BaseAgent):
         self.online_net.train()
         current_q = self.online_net(states).gather(1, actions)
 
-        # 4. Target Q calculation with Action Masking
+        # 4. Target Q calculation with Action Masking via (1 - m) * (-1e9)
         with torch.no_grad():
-            online_next_q = self.online_net(next_states)
-            # Mask invalid actions in next states with -1e9
-            invalid_mask = (next_masks == 0.0)
-            online_next_q[invalid_mask] = -1e9
+            mask_penalty = (1.0 - next_masks) * (-1e9)
+            online_next_q = self.online_net(next_states) + mask_penalty
 
             if self.use_double_dqn:
                 # Double DQN: action selected by Online Net, evaluated by Target Net
@@ -268,8 +289,7 @@ class DQNAgent(BaseAgent):
                 target_next_q = self.target_net(next_states).gather(1, best_next_actions)
             else:
                 # Standard DQN: max action evaluated by Target Net
-                target_all_next_q = self.target_net(next_states)
-                target_all_next_q[invalid_mask] = -1e9
+                target_all_next_q = self.target_net(next_states) + mask_penalty
                 target_next_q = target_all_next_q.max(dim=1, keepdim=True)[0]
 
             expected_q = rewards + (1.0 - dones) * self.gamma * target_next_q
@@ -285,14 +305,24 @@ class DQNAgent(BaseAgent):
         if self.total_steps % self.target_update_freq == 0:
             self.target_net.load_state_dict(self.online_net.state_dict())
 
-        # 7. Decay epsilon
-        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+        # 7. Optional per-step epsilon decay if episodic decay is disabled
+        if not self.decay_on_episode_end:
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
+        td_loss_val = float(loss.item())
+        mean_q_val = float(current_q.mean().item())
         return {
-            "loss": float(loss.item()),
-            "q_val": float(current_q.mean().item()),
+            "td_loss": td_loss_val,
+            "mean_q": mean_q_val,
             "epsilon": float(self.epsilon),
+            "loss": td_loss_val,
+            "q_val": mean_q_val,
         }
+
+    def on_episode_end(self) -> None:
+        """Decay epsilon multiplicatively at the end of an episode."""
+        if self.decay_on_episode_end:
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
     def save(self, filepath: str) -> None:
         """Save PyTorch network weights."""
@@ -304,6 +334,7 @@ class DQNAgent(BaseAgent):
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "epsilon": self.epsilon,
                 "total_steps": self.total_steps,
+                "use_double_dqn": self.use_double_dqn,
             },
             filepath,
         )
@@ -311,9 +342,43 @@ class DQNAgent(BaseAgent):
     def load(self, filepath: str) -> None:
         """Load PyTorch network weights."""
         if os.path.exists(filepath):
-            checkpoint = torch.load(filepath, map_location=self.device)
-            self.online_net.load_state_dict(checkpoint["online_state_dict"])
-            self.target_net.load_state_dict(checkpoint["target_state_dict"])
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            self.epsilon = checkpoint.get("epsilon", self.epsilon)
-            self.total_steps = checkpoint.get("total_steps", self.total_steps)
+            checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
+            if isinstance(checkpoint, dict) and "online_state_dict" in checkpoint:
+                self.online_net.load_state_dict(checkpoint["online_state_dict"])
+                self.target_net.load_state_dict(
+                    checkpoint.get("target_state_dict", checkpoint["online_state_dict"])
+                )
+                if "optimizer_state_dict" in checkpoint:
+                    self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                self.epsilon = float(checkpoint.get("epsilon", self.epsilon))
+                self.total_steps = int(checkpoint.get("total_steps", self.total_steps))
+            else:
+                self.online_net.load_state_dict(checkpoint)
+                self.target_net.load_state_dict(checkpoint)
+
+    def export_onnx(self, filepath: str) -> None:
+        """Export masked Q-Network to ONNX taking (obs, action_mask) -> (masked_q_values, best_action)."""
+        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+        cpu_net = copy.deepcopy(self.online_net).to("cpu").eval()
+        wrapper = DQNOnnxWrapper(cpu_net).eval()
+
+        dummy_obs = torch.zeros(1, STATE_DIM, dtype=torch.float32)
+        dummy_mask = torch.ones(1, ACTION_DIM, dtype=torch.float32)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            torch.onnx.export(
+                wrapper,
+                (dummy_obs, dummy_mask),
+                filepath,
+                input_names=["obs", "action_mask"],
+                output_names=["masked_q_values", "best_action"],
+                dynamic_axes={
+                    "obs": {0: "batch_size"},
+                    "action_mask": {0: "batch_size"},
+                    "masked_q_values": {0: "batch_size"},
+                    "best_action": {0: "batch_size"},
+                },
+                opset_version=17,
+                dynamo=False,
+            )

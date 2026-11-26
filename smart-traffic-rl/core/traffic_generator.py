@@ -8,7 +8,7 @@ Cung cấp khả năng kiểm soát Random Seed để nhân bản 2 luồng xe g
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 import numpy as np
 
 from .config import (
@@ -70,6 +70,8 @@ class TrafficGenerator:
         self._seed: Optional[int] = seed
         self._rng: np.random.Generator = np.random.default_rng(seed)
         self._vehicle_counter: int = 0
+        self.spawner_enabled: bool = True
+        self._live_rates: Optional[dict[int, float]] = None
 
         if scenario_id not in SCENARIOS:
             raise ValueError(
@@ -88,6 +90,49 @@ class TrafficGenerator:
         self._rng = np.random.default_rng(self._seed)
         self._vehicle_counter = 0
 
+    def set_spawner_enabled(self, enabled: bool) -> None:
+        """Bật hoặc tắt sinh phương tiện mới (phục vụ nút SpawnerCar: On/Off)."""
+        self.spawner_enabled = bool(enabled)
+
+    def set_live_rates(
+        self,
+        rates: Optional[dict[Any, float] | Sequence[float]],
+    ) -> None:
+        """Cập nhật nóng cường độ dòng xe lambda_i (xe/giây) từ giao diện Live Injection.
+
+        Truyền None để khôi phục về hàm cường độ mặc định của kịch bản.
+        """
+        if rates is None:
+            self._live_rates = None
+            return
+
+        if isinstance(rates, (list, tuple)):
+            if len(rates) != len(APPROACHES):
+                raise ValueError(f"Expected 4 arrival rates for [N, S, E, W], got {len(rates)}")
+            self._live_rates = {
+                app: max(0.0, float(rates[idx]))
+                for idx, app in enumerate(APPROACHES)
+            }
+            return
+
+        # Hỗ trợ khóa int (NORTH..WEST) hoặc khóa chuỗi ("N","S","E","W")
+        str_map = {"N": NORTH, "S": SOUTH, "E": EAST, "W": WEST,
+                   "NORTH": NORTH, "SOUTH": SOUTH, "EAST": EAST, "WEST": WEST}
+        resolved: dict[int, float] = dict(self.scenario.rate_func(0.0))
+        if self._live_rates is not None:
+            resolved.update(self._live_rates)
+
+        for k, v in rates.items():
+            if isinstance(k, str):
+                app_id = str_map.get(k.upper())
+                if app_id is None:
+                    raise ValueError(f"Invalid approach key: {k}")
+            else:
+                app_id = int(k)
+            resolved[app_id] = max(0.0, float(v))
+
+        self._live_rates = resolved
+
     def set_scenario(self, scenario_id: str) -> None:
         """Chuyển đổi kịch bản lưu lượng xe lúc runtime.
 
@@ -100,6 +145,7 @@ class TrafficGenerator:
             )
         self.scenario_id = scenario_id
         self.scenario = SCENARIOS[scenario_id]
+        self._live_rates = None
 
     def get_arrival_rates(self, current_time: float) -> dict[int, float]:
         """Truy vấn cường độ dòng xe lambda_i (xe/giây) của 4 nhánh tại thời điểm t.
@@ -110,6 +156,8 @@ class TrafficGenerator:
         Returns:
             Dict ánh xạ Approach ID -> lambda (xe/giây).
         """
+        if self._live_rates is not None:
+            return dict(self._live_rates)
         return self.scenario.rate_func(current_time)
 
     def generate_arrivals(
@@ -130,9 +178,11 @@ class TrafficGenerator:
         Returns:
             Dict ánh xạ Approach ID -> danh sách các đối tượng Vehicle mới xuất hiện.
         """
-        rates = self.get_arrival_rates(current_time)
         new_vehicles: dict[int, list[Vehicle]] = {app: [] for app in APPROACHES}
+        if not self.spawner_enabled:
+            return new_vehicles
 
+        rates = self.get_arrival_rates(current_time)
         for app in APPROACHES:
             # Kỳ vọng số xe đến trong khoảng delta_t: E[A_i] = lambda_i * delta_t
             lam = rates.get(app, 0.0) * delta_t
@@ -149,6 +199,23 @@ class TrafficGenerator:
 
         return new_vehicles
 
+    def sample_arrivals(
+        self,
+        current_time: float = 0.0,
+        delta_t: float = float(DELTA_T_GREEN),
+    ) -> list[list[Vehicle]]:
+        """Lấy mẫu xe đến dưới dạng danh sách 4 nhánh [[N], [S], [E], [W]].
+
+        Khi self.spawner_enabled == False, trả về [[], [], [], []].
+        """
+        if not self.spawner_enabled:
+            return [[], [], [], []]
+        arrivals_dict = self.generate_arrivals(current_time=current_time, delta_t=delta_t)
+        return [arrivals_dict[app] for app in APPROACHES]
+
     def clone_synchronized_generator(self) -> TrafficGenerator:
         """Tạo một bản sao độc lập nhưng cùng seed ban đầu để sinh 2 luồng xe giống hệt nhau (A/B testing)."""
-        return TrafficGenerator(scenario_id=self.scenario_id, seed=self._seed)
+        clone = TrafficGenerator(scenario_id=self.scenario_id, seed=self._seed)
+        clone.spawner_enabled = self.spawner_enabled
+        clone._live_rates = dict(self._live_rates) if self._live_rates is not None else None
+        return clone
