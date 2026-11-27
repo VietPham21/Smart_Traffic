@@ -111,6 +111,7 @@ class TrafficLightEnv(gym.Env):
 
         self._passed_window: deque[tuple[float, int]] = deque()
         self.last_step_switched: bool = False
+        self.last_step_passed_by_approach: list[int] = [0, 0, 0, 0]
         self.light_states: dict[str, str] = self._compute_light_states(self.phase)
 
     @property
@@ -154,6 +155,7 @@ class TrafficLightEnv(gym.Env):
         self.max_wait_recorded = 0.0
         self._passed_window.clear()
         self.last_step_switched = False
+        self.last_step_passed_by_approach = [0, 0, 0, 0]
         self.light_states = self._compute_light_states(self.phase)
 
         observation = self._compute_observation()
@@ -276,6 +278,7 @@ class TrafficLightEnv(gym.Env):
             "phase_duration": float(self.phase_duration),
             "action_mask": self.get_action_mask(),
             "step_passed_vehicles": int(passed_vehicles),
+            "step_passed_by_approach": list(self.last_step_passed_by_approach),
             "total_passed": int(self.total_passed_vehicles),
             "avg_wait_time": float(avg_wait),
             # Các khóa bổ sung phục vụ Pygame HUD, TensorBoard & Truncation Bootstrap
@@ -305,6 +308,7 @@ class TrafficLightEnv(gym.Env):
     ) -> int:
         """Giải phóng xe ở các nhánh xanh theo thứ tự FIFO và tính thời gian chờ thực."""
         passed = 0
+        per_app_passed = [0, 0, 0, 0]
         t_eff_start = t_green_start + startup_delay
         green_approaches = PHASE_APPROACHES[self.phase]
 
@@ -320,8 +324,10 @@ class TrafficLightEnv(gym.Env):
                     self.max_wait_recorded = float(wait_t)
                 self.total_wait_time_accumulated += wait_t
                 passed += 1
+                per_app_passed[int(app)] += 1
                 self.total_passed_vehicles += 1
 
+        self.last_step_passed_by_approach = per_app_passed
         return passed
 
     def step(

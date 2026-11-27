@@ -266,7 +266,7 @@ class TrafficLightWidget:
                 self._yellow_axis = ("N", "S")
             else:
                 self._yellow_axis = ("E", "W")
-            self._yellow_timer = 0.45
+            self._yellow_timer = 0.22
         self._last_observed_lights = light_states
 
     def update(self, dt: float) -> None:
@@ -388,11 +388,12 @@ class VisualVehicle:
         self.v_type = v_type
         self.maneuver = maneuver
         self.color = color
+        self.yield_timer = 0.0
         self.length, self.width = self.SPECS.get(v_type, (22, 13))
 
-    def step_kinematics(self, dt: float, target_dist: float, v_max: float = 210.0) -> None:
-        a_acc = 320.0
-        b_brk = 420.0
+    def step_kinematics(self, dt: float, target_dist: float, v_max: float = 420.0) -> None:
+        a_acc = 1400.0
+        b_brk = 1200.0
         gap = max(0.0, target_dist - self.dist)
         v_des = min(v_max, math.sqrt(2.0 * b_brk * gap)) if gap > 0.5 else 0.0
 
@@ -439,6 +440,7 @@ class VisualTrafficScene:
 
         self.vehicles: list[VisualVehicle] = []
         self._next_uid: int = 1
+        self._rr_cursor: int = 0
         self._sprite_cache: dict[tuple[Any, ...], pygame.Surface] = {}
         self.last_info: dict[str, Any] = {
             "raw_queues": [0, 0, 0, 0],
@@ -558,6 +560,7 @@ class VisualTrafficScene:
 
         raw_queues = info.get("raw_queues", [0, 0, 0, 0])
         step_passed = int(info.get("step_passed_vehicles", 0))
+        per_app_passed = info.get("step_passed_by_approach")
         light_states = info.get("light_states", {"N": "GREEN", "S": "GREEN", "E": "RED", "W": "RED"})
 
         green_apps = [app for app in APPROACHES if light_states.get(APPROACH_KEYS[app]) == "GREEN"]
@@ -569,26 +572,47 @@ class VisualTrafficScene:
             for app in APPROACHES
         }
 
-        # Step 1: Discharge head vehicles from green approaches matching step_passed_vehicles
-        remaining_pass = step_passed
-        if remaining_pass > 0 and green_apps:
-            idx_turn = 0
+        # Step 1: Discharge head vehicles accurately per approach (using exact counts when available)
+        if per_app_passed is not None and len(per_app_passed) == len(APPROACHES):
+            for app in APPROACHES:
+                pass_cnt = max(0, int(per_app_passed[app]))
+                for _ in range(pass_cnt):
+                    if queued_by_app[app]:
+                        lead_v = queued_by_app[app].pop(0)
+                        lead_v.is_discharged = True
+                        lead_v.queue_idx = -1
+                        lead_v.speed = max(lead_v.speed, 260.0)
+                    else:
+                        stop_dist, _, _ = self._entry_and_stop_dist(app)
+                        min_dist = min((v.dist for v in self.vehicles if v.approach == app), default=stop_dist)
+                        expr = self._spawn_vehicle(app, dist=0.0, queue_idx=-1, speed=320.0)
+                        expr.dist = min(stop_dist - 0.5 * expr.length - 4.0, min_dist - expr.length - self.min_gap)
+                        expr.is_discharged = True
+                        self.vehicles.append(expr)
+        elif step_passed > 0 and green_apps:
+            remaining_pass = step_passed
             safety_guard = 0
             while remaining_pass > 0 and safety_guard < 100:
                 safety_guard += 1
-                app = green_apps[idx_turn % len(green_apps)]
-                idx_turn += 1
+                # Prefer green approach that currently has surplus vehicles vs target raw_queues
+                surplus_apps = [
+                    a for a in green_apps if len(queued_by_app[a]) > int(raw_queues[a])
+                ]
+                if surplus_apps:
+                    app = surplus_apps[self._rr_cursor % len(surplus_apps)]
+                else:
+                    app = green_apps[self._rr_cursor % len(green_apps)]
+                self._rr_cursor += 1
                 if queued_by_app[app]:
                     lead_v = queued_by_app[app].pop(0)
                     lead_v.is_discharged = True
                     lead_v.queue_idx = -1
-                    lead_v.speed = max(lead_v.speed, 130.0)
+                    lead_v.speed = max(lead_v.speed, 260.0)
                     remaining_pass -= 1
                 elif all(not queued_by_app[a] for a in green_apps):
-                    # Vehicles both arrived & departed within same decision step: spawn safely behind any active car
                     stop_dist, _, _ = self._entry_and_stop_dist(app)
                     min_dist = min((v.dist for v in self.vehicles if v.approach == app), default=stop_dist)
-                    expr = self._spawn_vehicle(app, dist=0.0, queue_idx=-1, speed=175.0)
+                    expr = self._spawn_vehicle(app, dist=0.0, queue_idx=-1, speed=320.0)
                     expr.dist = min(stop_dist - 0.5 * expr.length - 4.0, min_dist - expr.length - self.min_gap)
                     expr.is_discharged = True
                     self.vehicles.append(expr)
@@ -613,7 +637,7 @@ class VisualTrafficScene:
                 # Ensure newly spawned car never overlaps ANY existing vehicle on this approach
                 all_app_dists = [v.dist for v in self.vehicles if v.approach == app]
                 min_existing_dist = min(all_app_dists, default=40.0)
-                nv = self._spawn_vehicle(app, dist=0.0, queue_idx=new_idx, speed=150.0)
+                nv = self._spawn_vehicle(app, dist=0.0, queue_idx=new_idx, speed=300.0)
                 nv.dist = min(0.0, min_existing_dist - nv.length - self.min_gap)
                 self.vehicles.append(nv)
                 q_list.append(nv)
@@ -626,37 +650,58 @@ class VisualTrafficScene:
         self.lights.update(dt)
         eff_states = self.lights.get_effective_states(self.last_info)
 
-        # Precompute current world poses and junction occupancy per approach
+        # Strict junction conflict box bounds: only vehicles physically inside asphalt conflict box
+        # (past stop_dist - 2.0 and before clearing box at stop_dist + junction_len - 8.0) block entry.
         poses: dict[int, tuple[float, float, float]] = {}
         in_junction_by_app: dict[int, list[VisualVehicle]] = {app: [] for app in APPROACHES}
 
         for v in self.vehicles:
             poses[v.uid] = self._compute_world_pose(v)
             stop_dist, junction_len, _ = self._entry_and_stop_dist(v.approach, v.maneuver)
-            stop_line_front = stop_dist - 0.5 * v.length
-            if stop_line_front - 4.0 < v.dist < stop_dist + junction_len + 0.5 * v.length:
+            if v.is_discharged and (stop_dist + 6.0 < v.dist < stop_dist + junction_len - 4.0):
                 in_junction_by_app[v.approach].append(v)
+
+        # Courtesy turn-slot for opposing left turns: prevents both deadlock and blind entry into oncoming stream
+        left_slot_claims: dict[int, Optional[int]] = {app: None for app in APPROACHES}
+        left_in_box: dict[int, bool] = {app: False for app in APPROACHES}
+        for v in self.vehicles:
+            if not v.is_discharged or v.maneuver != "left":
+                continue
+            sdist, jlen, _ = self._entry_and_stop_dist(v.approach, "left")
+            hold_d = max(0.0, sdist - 0.5 * v.length - 4.0)
+            if sdist + 6.0 <= v.dist <= sdist + jlen * 0.96:
+                left_in_box[v.approach] = True
+            elif (hold_d - 12.0 <= v.dist < sdist + 6.0) and v.yield_timer >= 0.25:
+                if eff_states.get(APPROACH_KEYS[v.approach]) == "GREEN":
+                    if left_slot_claims[v.approach] is None or v.uid < left_slot_claims[v.approach]:
+                        left_slot_claims[v.approach] = v.uid
 
         surviving: list[VisualVehicle] = []
         for app in APPROACHES:
-            stop_dist, junction_len_straight, _ = self._entry_and_stop_dist(app, "straight")
+            stop_dist, _, _ = self._entry_and_stop_dist(app, "straight")
             is_green_now = (eff_states.get(APPROACH_KEYS[app]) == "GREEN")
 
-            # Cross-axis approaches (perpendicular traffic)
+            # Cross-axis approaches (perpendicular traffic actively inside intersection box)
             perp_apps = (EAST, WEST) if app in (NORTH, SOUTH) else (NORTH, SOUTH)
             perp_in_junction = any(len(in_junction_by_app[p]) > 0 for p in perp_apps)
 
-            # Opposing approach (for left-turn yield rule: left turns yield to ALL opposing vehicles inside box,
-            # AND to any opposing left-turn with lower uid waiting at stop line to break tie cleanly)
             opp_app = self._opposite_approach(app)
             opp_in_junction = len(in_junction_by_app[opp_app]) > 0
-            opp_straight_near_entry = any(
-                (not ov.is_discharged or ov.is_discharged)
-                and is_green_now
+            opp_stop_dist, _, _ = self._entry_and_stop_dist(opp_app, "straight")
+            opp_straight_entering = any(
+                ov.is_discharged
                 and ov.maneuver != "left"
-                and (stop_dist - 55.0 <= ov.dist <= stop_dist + 5.0)
+                and ov.speed > 50.0
+                and (opp_stop_dist - 22.0 <= ov.dist <= opp_stop_dist + 40.0)
                 for ov in self.vehicles
                 if ov.approach == opp_app
+            )
+            opp_left_in_box = left_in_box[opp_app]
+            my_claim = left_slot_claims[app]
+            opp_claim = left_slot_claims[opp_app]
+            opp_holds_left_slot = (
+                opp_claim is not None
+                and (my_claim is None or opp_claim < my_claim)
             )
 
             app_vehs = sorted(
@@ -688,27 +733,48 @@ class VisualTrafficScene:
 
                 if v.is_discharged:
                     target = exit_dist
-                    # 1. Before entering junction: strictly wait if cross-traffic still clearing OR signal not GREEN
-                    if v.dist <= stop_hold_dist + 2.0:
+                    # 1. Before entering asphalt conflict zone (crosswalk gate <= v_stop_dist + 4.0):
+                    if v.dist <= v_stop_dist + 4.0:
+                        hold_pt = min(stop_hold_dist, v.dist) if v.dist > stop_hold_dist else stop_hold_dist
                         if not is_green_now or perp_in_junction:
-                            target = stop_hold_dist
+                            target = hold_pt
+                            v.yield_timer = 0.0
                         elif v.maneuver == "left":
                             opp_priority_left = any(
-                                ov.maneuver == "left" and ov.is_discharged and ov.uid < v.uid
-                                and (v_stop_dist - 60.0 <= ov.dist <= v_stop_dist + v_junction_len)
-                                for ov in self.vehicles if ov.approach == opp_app
+                                ov.is_discharged
+                                and ov.maneuver == "left"
+                                and ov.uid < v.uid
+                                and (opp_stop_dist - 10.0 <= ov.dist <= opp_stop_dist + v_junction_len * 0.96)
+                                for ov in self.vehicles
+                                if ov.approach == opp_app
                             )
-                            if opp_in_junction or opp_straight_near_entry or opp_priority_left:
-                                target = stop_hold_dist
+                            if opp_in_junction or opp_left_in_box or opp_straight_entering or opp_priority_left or opp_holds_left_slot:
+                                target = hold_pt
+                                if (v.dist >= stop_hold_dist - 12.0) and not opp_holds_left_slot:
+                                    v.yield_timer += dt
+                            else:
+                                # Keep yield_timer lock active across [hold_pt .. v_stop_dist + 6.0] so
+                                # opp stays yielded while this left-turn launches into `left_in_box`!
+                                if v.dist >= v_stop_dist + 4.0:
+                                    v.yield_timer = 0.0
+                        else:
+                            # Straight / right traffic waits before crosswalk if opposing left turn
+                            # is still inside the box OR has claimed the next turn slot
+                            if opp_left_in_box or opp_holds_left_slot:
+                                target = hold_pt
+                            v.yield_timer = 0.0
                 else:
                     target = queue_targets.get(v.uid, stop_hold_dist)
+                    v.yield_timer = 0.0
 
                 # 2. Active 2D Spatial Yielding inside junction box against ANY other approach's vehicle
-                if v.dist > stop_hold_dist - 12.0 and v.dist < v_stop_dist + v_junction_len + 15.0:
+                if v.dist > stop_hold_dist + 2.0 and v.dist < v_stop_dist + v_junction_len + 12.0:
                     vx, vy, vdeg = poses[v.uid]
                     v_rad = math.radians(vdeg)
-                    look_x = vx + math.cos(v_rad) * 38.0
-                    look_y = vy + math.sin(v_rad) * 38.0
+                    fwd_x, fwd_y = math.cos(v_rad), math.sin(v_rad)
+                    look_dist = 36.0 + 0.06 * v.speed
+                    look_x = vx + fwd_x * look_dist
+                    look_y = vy + fwd_y * look_dist
                     u_self = (v.dist - v_stop_dist) / max(1.0, v_junction_len)
 
                     for other_app in APPROACHES:
@@ -716,24 +782,20 @@ class VisualTrafficScene:
                             continue
                         for ov in in_junction_by_app[other_app]:
                             ox, oy, _ = poses[ov.uid]
-                            dist_center = math.hypot(ox - vx, oy - vy)
+                            dx_o, dy_o = ox - vx, oy - vy
+                            proj_fwd = dx_o * fwd_x + dy_o * fwd_y
+                            dist_center = math.hypot(dx_o, dy_o)
                             dist_look = math.hypot(ox - look_x, oy - look_y)
                             min_2d_safe = 0.5 * (v.length + ov.length) + 12.0
-                            if dist_center < min_2d_safe or dist_look < min_2d_safe:
+                            if (dist_center < min_2d_safe or dist_look < min_2d_safe) and proj_fwd > -4.0:
                                 o_stop, o_jlen, _ = self._entry_and_stop_dist(ov.approach, ov.maneuver)
                                 u_other = (ov.dist - o_stop) / max(1.0, o_jlen)
-                                self_is_left = (v.maneuver == "left")
-                                other_is_left = (ov.maneuver == "left")
 
-                                if other_app != opp_app:
-                                    other_has_priority = (u_other > u_self + 0.03) or (abs(u_other - u_self) <= 0.03 and ov.uid < v.uid)
+                                # Strict antisymmetric priority: prevents deadlocks while clearing front vehicle
+                                if abs(u_other - u_self) > 0.025:
+                                    other_has_priority = (u_other > u_self)
                                 else:
-                                    if self_is_left and not other_is_left:
-                                        other_has_priority = True
-                                    elif self_is_left == other_is_left:
-                                        other_has_priority = (u_other > u_self + 0.03) or (abs(u_other - u_self) <= 0.03 and ov.uid < v.uid)
-                                    else:
-                                        other_has_priority = False
+                                    other_has_priority = (ov.uid < v.uid)
 
                                 if other_has_priority:
                                     target = min(target, v.dist)

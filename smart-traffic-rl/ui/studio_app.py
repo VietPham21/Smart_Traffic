@@ -865,7 +865,7 @@ class SplitScreenStudio:
                         self.is_running = False
                         break
                 else:
-                    step_interval_ms = max(60, 700 // max(1, self.sim_speed))
+                    step_interval_ms = max(80, 900 // max(1, self.sim_speed))
                     if now - last_step_ticks >= step_interval_ms:
                         self.step()
                         last_step_ticks = now
